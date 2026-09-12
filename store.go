@@ -6,7 +6,15 @@ package lokv
 import (
 	"context"
 	"errors"
+	"io"
 )
+
+// SizeReaderAt is a fixed-size byte source. Size returns its nonnegative length.
+// ReadAt must support concurrent calls, as required by io.ReaderAt.
+type SizeReaderAt interface {
+	Size() int64
+	io.ReaderAt
+}
 
 // Store is a sorted, create-only key/value namespace. Implementations must be
 // safe for concurrent use and honor context cancellation.
@@ -15,7 +23,8 @@ import (
 // with exactly one winner among concurrent creators. Successful creation must
 // be immediately visible to both Get and List. List must return globally
 // ascending bytewise keys for the requested prefix and honor its result limit.
-// Returned buffers belong to the caller; Create must not retain a mutable input.
+// The caller owns Get's reader and must close it. Create must not retain its
+// input after returning; the caller keeps the source open and unchanged until then.
 //
 // Values are immutable. The storage authority must prohibit overwrites,
 // deletion, and lifecycle expiration. Open cannot verify these operational
@@ -26,14 +35,18 @@ type Store interface {
 	// limit must be positive. A successful Create is immediately visible to List.
 	List(ctx context.Context, prefix string, limit int) ([]string, error)
 
-	// Get returns the complete object, or an error matching ErrNotFound.
-	// Packed objects grow with their covered history and have no size limit.
-	Get(ctx context.Context, key string) ([]byte, error)
+	// Get opens an object, or returns an error matching ErrNotFound.
+	// The caller must close the reader. ctx governs reads until it is closed.
+	// Each call returns an independent stream, with errors reported by Read.
+	Get(ctx context.Context, key string) (io.ReadCloser, error)
 
 	// Create atomically publishes a complete value only if key is absent.
 	// Exactly one concurrent creator wins; losers return ErrExists after the
 	// winner is visible. Create must never overwrite an existing value.
-	Create(ctx context.Context, key string, value []byte) error
+	// It reads exactly value.Size() bytes starting at offset zero, and may reread
+	// them for retries. It does not close value. A source read error must not
+	// publish a partial value.
+	Create(ctx context.Context, key string, value SizeReaderAt) error
 }
 
 var (

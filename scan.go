@@ -128,14 +128,8 @@ func (lg *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield fu
 		if end < r.First || start > r.Last {
 			return nil
 		}
-		records, err := lg.loadRecords(ctx, ref, nil)
-		if err != nil {
+		if err := lg.readRecords(ctx, ref, nil, emit); err != nil {
 			return fmt.Errorf("scan %s: %w", ref.Key, err)
-		}
-		for _, p := range records {
-			if err := emit(p); err != nil {
-				return err
-			}
 		}
 		return nil
 	}

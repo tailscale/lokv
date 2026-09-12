@@ -55,13 +55,6 @@ type projection struct {
 	RecordHash         string          `json:"record_hash"`
 	Event              json.RawMessage `json:"event"`
 }
-type segment struct {
-	Format  string       `json:"format"`
-	Level   uint8        `json:"level"`
-	Start   string       `json:"start"`
-	End     string       `json:"end"`
-	Records []projection `json:"records"`
-}
 
 func hexRevision(r int64) string { return fmt.Sprintf("%016x", r) }
 

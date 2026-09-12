@@ -139,6 +139,11 @@ The core package depends only on this public interface:
 ```go
 package lokv
 
+type SizeReaderAt interface {
+    Size() int64
+    io.ReaderAt
+}
+
 // Store is a flat key/value namespace. Values and successful creations are
 // immutable. Implementations must satisfy the consistency contract below.
 type Store interface {
@@ -146,14 +151,16 @@ type Store interface {
     // bytewise lexicographical comparison. limit must be positive.
     List(ctx context.Context, prefix string, limit int) ([]string, error)
 
-    // Get returns the complete value for key. It returns an error matching
-    // ErrNotFound when key does not exist.
-    Get(ctx context.Context, key string) ([]byte, error)
+    // Get opens the value for key. The caller must close the reader.
+    // ctx governs reads until closure. An absent key returns ErrNotFound.
+    Get(ctx context.Context, key string) (io.ReadCloser, error)
 
     // Create atomically creates key with value if and only if key is absent.
     // It returns an error matching ErrExists if key already exists. It must
     // never overwrite an existing value and must never expose a partial value.
-    Create(ctx context.Context, key string, value []byte) error
+    // value supplies exactly Size() bytes starting at offset zero. The caller
+    // keeps it open and unchanged until Create returns. Create does not close it.
+    Create(ctx context.Context, key string, value SizeReaderAt) error
 }
 
 var (
@@ -162,8 +169,11 @@ var (
 )
 ```
 
-All returned byte slices are owned by the caller. Implementations may copy on
-return; the core must not retain or mutate a Store-owned buffer after the call.
+Each successful Get returns an independent reader owned by the caller. Reading
+may fail after Get succeeds, and the caller must close the stream on every path.
+Create may use independent section readers over its SizeReaderAt for retries;
+source read failures must never publish a partial object. Size is nonnegative
+and stable, and reads starting at offset zero cover the complete value.
 Keys are opaque UTF-8 strings to the store, but ordering must be exactly bytewise
 so fixed-width lowercase hexadecimal keys behave identically on every backend.
 
@@ -196,9 +206,10 @@ that tradeoff explicit.
 The first adapter should target a general-purpose Amazon S3 bucket:
 
 - `List` uses `ListObjectsV2` and requests `MaxKeys=limit`;
-- `Get` uses `GetObject` and reads the complete response body;
+- `Get` uses `GetObject` and returns its response body as an `io.ReadCloser`;
 - `Create` uses `PutObject` with `If-None-Match: *` and maps HTTP 412 to
-  `ErrExists`; HTTP 409 is retried as directed by S3;
+  `ErrExists`; HTTP 409 is retried as directed by S3. Each attempt gets a fresh
+  section reader and uses the explicit Size() as its content length;
 - S3 creation is atomic and subsequent GET/LIST operations are strongly
   consistent.
 
@@ -378,9 +389,11 @@ For example, a level-1 segment contains 16:
 }
 ```
 
-Marshal the canonical JSON, hash the uncompressed bytes, then compress with
-zstd. The object key uses the uncompressed digest. Readers decompress, hash the
-result, compare it with the key/reference, then decode. Use one fixed zstd
+Stream canonical JSON through a hasher and zstd encoder into a temporary file.
+Use Go 1.27's json/v2 and jsontext APIs to process one record at a time. Preserve
+v1 JSON semantics for record projections, including raw event escapes and
+number spellings. The uncompressed digest determines the object key; the
+compressed file's counted length supplies Size() for upload. Use one fixed zstd
 configuration: default compression level, one encoder worker, a 1 MiB window,
 and checksums. The decoder bounds the window but imposes no output-size limit.
 
@@ -392,8 +405,22 @@ Every record retains its original event bytes, commit ID, and hash.
 Compaction copies payloads at each completed level. Old objects remain stored
 for historical snapshots. This increases retained bytes and compaction work
 with the number of levels, while reducing full scans to the frontier objects.
-Object sizes are unbounded; the current API buffers objects and intermediate
-JSON in memory. Streaming is deferred to a later API change.
+Object sizes are unbounded. Transfers, record arrays, and zstd encoding/decoding
+are streamed. Commits and individual batches remain buffered, but higher-level
+segments never materialize whole-range byte arrays or projection slices.
+
+Temporary files live in os.TempDir. On non-Windows systems, unlink each file
+immediately after creation and use its open descriptor. On Windows, close it
+before removing its name. All success, failure, and cancellation paths clean up
+owned files and response streams.
+
+Downloads spool compressed bytes to a file, check zstd framing using fixed-size
+ReadAt calls, then decode and hash the stream while writing projections to a
+private record spool. That spool uses JSON values separated by newlines; it is
+scratch data, not the wire format. Validate the complete envelope, record chain,
+and digest before returning the spool to consumers. Scans replay it one batch
+at a time without another Store Get. Memory is proportional to batch sizes and
+codec buffers; temporary disk usage is proportional to processed ranges.
 
 ## 8. Public Go API
 
@@ -547,9 +574,11 @@ store.Create(logKey(R+1), newCommit) // publish last
 Creating a packed segment requires all records from 16 children. At level 1,
 children are raw commits; the prior head body is already loaded and reused. At
 higher levels, children are packed segments. Fetch with at most four concurrent
-GETs, decode and validate each child, then concatenate its record projections
-in range order. Serialize and compress the complete combined range. Validate
-its record count, adjacency, and hash boundaries before publication.
+GETs, decoding and validating each child into a private record spool. Replay
+those spools in range order through a streaming JSON encoder, hasher, and zstd
+encoder into the temporary upload file. Close each input spool after consuming
+it. Validate record count, adjacency, and hash boundaries before publication;
+no whole-range projection slice or JSON byte slice is built.
 
 Aggregate writes are also conditional creates. If `Create` returns `ErrExists`, GET
 and validate it, then treat it as success. Concurrent writers based on the same
@@ -596,8 +625,10 @@ To read a snapshot in chronological order:
 
 For a range scan, compare the requested inclusive range with each reference's
 `start..end` and skip disjoint ranges. A partially intersecting segment at any
-level is downloaded, decompressed, and validated in full, then filtered by
-revision. All frontier objects are fetched sequentially.
+level is downloaded, decompressed, and validated in full using disk spools,
+then replayed and filtered by revision. Public callbacks never receive records
+from a segment that fails validation, even at its end. All frontier objects
+are fetched sequentially, and callback failures close all owned spools.
 
 Normal `Scan` validates every fetched object's content digest, format, level,
 range, internal adjacency, record hashes, and the hash-chain boundary between
@@ -704,9 +735,10 @@ account):
 }
 ```
 
-The current adapter uses single-request `PutObject` and buffers complete
-objects. It does not impose its own object-size cap. Streaming and multipart
-support are deferred; the compaction protocol does not bound upper-level sizes.
+The adapter streams single-request `PutObject` from a section reader over the
+SizeReaderAt source. It does not impose its own object-size cap. Multipart
+support is separate future work; the compaction protocol does not bound
+upper-level sizes.
 
 ## 14. Limits and defensive decoding
 
@@ -805,6 +837,8 @@ At minimum:
 13. Context cancellation stops retries and bounded concurrent GET work.
 14. Reject oversized new batches before I/O; lowering the append limit must
     preserve old reads and compaction. Test large and unknown-size zstd frames.
+    Verify streaming preserves canonical v3 bytes, corrupt segments never yield
+    a prefix, and success/failure/cancellation paths close all temporary files.
 15. A generic store conformance suite checks sorted limited listing, immediate
     create visibility, atomic values, exactly one winner, and sentinel errors.
 16. A live, general-purpose S3 adapter test confirms that `LIST MaxKeys=1` sees

@@ -4,6 +4,7 @@
 package s3store_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -59,7 +60,7 @@ func TestLiveS3(t *testing.T) {
 	if err != nil || len(keys) != 1 || keys[0] != prefix+"log/v1/log/7fffffffffffffee.json" {
 		t.Fatalf("one-key LIST: %v %v", keys, err)
 	}
-	if err := store.Create(ctx, keys[0], []byte("overwrite")); !errors.Is(err, lokv.ErrExists) {
+	if err := store.Create(ctx, keys[0], bytes.NewReader([]byte("overwrite"))); !errors.Is(err, lokv.ErrExists) {
 		t.Fatalf("conditional duplicate PUT: %v", err)
 	}
 	snap, err := lg.LoadHead(ctx)

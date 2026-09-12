@@ -4,12 +4,14 @@
 package lokv
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
 	"unicode"
@@ -178,7 +180,7 @@ func (lg *Log[T]) checkSnapshot(s *Snapshot[T]) error {
 	return nil
 }
 
-func (lg *Log[T]) get(ctx context.Context, key string, referenced bool) ([]byte, error) {
+func (lg *Log[T]) openObject(ctx context.Context, key string, referenced bool) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -187,6 +189,19 @@ func (lg *Log[T]) get(ctx context.Context, key string, referenced bool) ([]byte,
 		if referenced && errors.Is(err, ErrNotFound) {
 			err = fmt.Errorf("%w: %w", ErrCorrupt, err)
 		}
+		return nil, fmt.Errorf("get %s: %w", key, err)
+	}
+	return b, nil
+}
+
+// get buffers only a commit, which contains one batch and its frontier.
+func (lg *Log[T]) get(ctx context.Context, key string, referenced bool) ([]byte, error) {
+	body, err := lg.openObject(ctx, key, referenced)
+	if err != nil {
+		return nil, err
+	}
+	b, readErr := io.ReadAll(contextReader{ctx, body})
+	if err := errors.Join(readErr, body.Close(), ctx.Err()); err != nil {
 		return nil, fmt.Errorf("get %s: %w", key, err)
 	}
 	return b, nil
@@ -398,7 +413,7 @@ func (lg *Log[T]) appendPrepared(ctx context.Context, base *Snapshot[T], event j
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	createErr := lg.store.Create(ctx, key, body)
+	createErr := lg.store.Create(ctx, key, bytes.NewReader(body))
 	if createErr == nil {
 		return s, nil
 	}

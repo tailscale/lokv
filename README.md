@@ -214,7 +214,10 @@ A conforming `Store` must provide:
 - Atomic create-if-absent with exactly one winner and no partial visibility.
 - Immediate visibility of successful creation to both GET and LIST.
 - Globally ascending bytewise prefix listing with a positive result limit.
-- Caller-owned returned buffers and safe concurrent calls.
+- Independent `io.ReadCloser` streams from `Get`, owned and closed by callers.
+- `Create` inputs implementing `SizeReaderAt` (`Size() int64` and `io.ReaderAt`),
+  kept open and unchanged until the call returns.
+- Safe concurrent calls and context cancellation during transfers.
 - Immutable values, with deletion unavailable to the library's authority.
 
 `Open` performs no I/O and cannot diagnose these deployment properties. Hashes
@@ -263,10 +266,36 @@ attempt without conflict retries.
 
 Compacted objects have no configured size limit in either the core or S3
 adapter. Compaction never rejects previously accepted data for exceeding a byte
-limit. The Store API and JSON implementation still buffer complete objects;
-streaming support is future work.
+limit. Store transfers, JSON record processing, and zstd compression are
+streamed. A commit still holds one complete batch and its frontier in memory;
+upper-level segments do not require whole-range byte slices or record slices.
+
+`Store.Get` returns an `io.ReadCloser` that the caller closes. `Store.Create`
+accepts a `SizeReaderAt`, so it knows the body length without seeking and can
+read it again for retries. `bytes.Reader`, `strings.Reader`, and
+`io.SectionReader` implement this interface. The S3 adapter creates a fresh
+section reader for each upload attempt and sets the content length explicitly.
+
+Temporary files use the operating system's temporary directory. On non-Windows
+systems they are unlinked immediately and accessed through the open descriptor;
+on Windows they are removed after closing. Normal returns, failures, and
+cancellation close the descriptors and remove any remaining names.
+
+A read first spools the compressed response to disk, validates its frame, then
+decodes and hashes it incrementally while spooling validated record projections.
+Only after the entire segment passes validation are its records replayed to
+scan callbacks. This needs one S3 GET, with additional local disk I/O.
+Compaction prepares children with at most four workers, then writes their
+records in order through JSON and zstd into a temporary upload file. The
+uncompressed hash determines its key, and its counted compressed length supplies
+`Size()`. Input spools are released as they are consumed.
+
+Memory use depends on individual batch sizes and codec buffers, not the whole
+compacted range. Temporary disk use grows with the range being processed.
+The `memstore` adapter necessarily retains its stored values in memory.
 
 Commit and segment envelopes use `lokv/commit/v3` and `lokv/segment/v3`.
+The streaming implementation preserves the v3 JSON bytes and hash definitions.
 Earlier envelopes are rejected. Every nonzero level uses a `.json.zst` packed
 segment; there are no reference-only index objects. Commit keys and the record
 hash algorithm are unchanged.
@@ -301,7 +330,12 @@ batches download with two GETs. Under `-race`, large packing, boundary, and cras
 workloads use two carry levels; normal runs retain the deeper coverage. CI runs
 both modes. HTTP tests exercise AWS SDK headers, status mapping, and packed
 full-scan request counts.
+Tests also cover stream ownership, read failures, retry replay, canonical wire
+compatibility, validation before callbacks, and temporary-file cleanup.
 Benchmarks report store requests and average carry depth alongside allocations.
+`BenchmarkStreamingCompaction` uses files for stored payloads and samples peak
+heap growth while compacting ranges of different sizes; run it with
+`go test -run '^$' -bench '^BenchmarkStreamingCompaction$' -benchtime=1x`.
 Fuzz targets cover key parsing, commit and segment decoding, frontier validation,
 and segment decompression; for example:
 

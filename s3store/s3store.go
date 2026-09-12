@@ -9,7 +9,6 @@
 package s3store
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -146,8 +145,8 @@ func (s *Store) List(ctx context.Context, prefix string, limit int) ([]string, e
 	return keys, nil
 }
 
-// Get reads and closes the complete response body without imposing a size limit.
-func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
+// Get opens an S3 response body. The caller must close it.
+func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -161,21 +160,20 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 	if out == nil || out.Body == nil {
 		return nil, s.wrap("get", key, lokv.ErrCorrupt)
 	}
-	defer out.Body.Close()
-	b, err := io.ReadAll(out.Body)
-	if err != nil {
-		return nil, s.wrap("get", key, err)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return b, nil
+	return &responseBody{s: s, ctx: ctx, key: key, body: out.Body}, nil
 }
 
 // Create only performs conditional, single-request PUTs. HTTP 409 is retried
 // with bounded jitter; HTTP 412 maps to ErrExists. Other transport retries are
 // handled by the configured AWS SDK retryer.
-func (s *Store) Create(ctx context.Context, key string, value []byte) error {
+func (s *Store) Create(ctx context.Context, key string, value lokv.SizeReaderAt) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if value == nil || value.Size() < 0 {
+		return errors.New("s3store: invalid value size")
+	}
+	size := value.Size()
 	contentType := "application/json"
 	if strings.HasSuffix(key, ".zst") {
 		contentType = "application/zstd"
@@ -184,7 +182,7 @@ func (s *Store) Create(ctx context.Context, key string, value []byte) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		_, err := s.client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key), Body: bytes.NewReader(value), ContentLength: aws.Int64(int64(len(value))), ContentType: aws.String(contentType), IfNoneMatch: aws.String("*")})
+		_, err := s.client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key), Body: io.NewSectionReader(value, 0, size), ContentLength: aws.Int64(size), ContentType: aws.String(contentType), IfNoneMatch: aws.String("*")})
 		if err == nil {
 			return nil
 		}
@@ -205,4 +203,30 @@ func (s *Store) Create(ctx context.Context, key string, value []byte) error {
 		case <-timer.C:
 		}
 	}
+}
+
+// responseBody keeps read and close failures associated with their S3 key.
+type responseBody struct {
+	s    *Store
+	ctx  context.Context
+	key  string
+	body io.ReadCloser
+}
+
+func (b *responseBody) Read(p []byte) (int, error) {
+	if err := b.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := b.body.Read(p)
+	if err != nil && err != io.EOF {
+		err = b.s.wrap("read", b.key, err)
+	}
+	return n, err
+}
+
+func (b *responseBody) Close() error {
+	if err := b.body.Close(); err != nil {
+		return b.s.wrap("close", b.key, err)
+	}
+	return nil
 }

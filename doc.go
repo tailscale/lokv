@@ -12,8 +12,10 @@
 // variadic values, publish the entire batch atomically, and consume one revision
 // per call. Stored events are always JSON arrays, including single-item batches.
 // Scan yields a complete batch per callback. An empty append returns ErrEmptyBatch.
-// MaxEventBytes limits new batches only. Compacted objects have no size limit;
-// reads and compaction currently buffer complete objects in memory.
+// MaxEventBytes limits new batches only. Compacted objects have no size limit.
+// Reads and compaction stream records through temporary files, keeping memory
+// proportional to individual batches and codec buffers. Files are unlinked on
+// creation except on Windows, where they are removed after closing.
 //
 // Revisions are int64 sequence numbers from 1 through [MaxRevision] (2^53 - 1,
 // JavaScript's Number.MAX_SAFE_INTEGER). Values outside that range are invalid.

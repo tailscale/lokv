@@ -218,7 +218,7 @@ func TestHTTPConflictRetries(t *testing.T) {
 			api := newAPI()
 			api.failures["key"] = tt.statuses
 			store := httpStore(t, api)
-			err := store.Create(context.Background(), "key", []byte("value"))
+			err := store.Create(context.Background(), "key", strings.NewReader("value"))
 			if tt.want == nil && err != nil || tt.want != nil && err == nil {
 				t.Fatal(err)
 			}
@@ -241,7 +241,7 @@ func TestHTTPRetryCancellation(t *testing.T) {
 	defer cancel()
 	api.cancel = cancel
 	store := httpStore(t, api)
-	if err := store.Create(ctx, "key", nil); !errors.Is(err, context.Canceled) {
+	if err := store.Create(ctx, "key", strings.NewReader("")); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	api.mu.Lock()
@@ -271,6 +271,7 @@ func TestHTTPPagination(t *testing.T) {
 type fakeClient struct {
 	get  func(context.Context, *s3.GetObjectInput) (*s3.GetObjectOutput, error)
 	list func(context.Context, *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error)
+	put  func(context.Context, *s3.PutObjectInput) (*s3.PutObjectOutput, error)
 }
 
 func (f *fakeClient) GetObject(ctx context.Context, in *s3.GetObjectInput, _ ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
@@ -281,8 +282,52 @@ func (f *fakeClient) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Inpu
 	return f.list(ctx, in)
 }
 
-func (f *fakeClient) PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
-	panic("unexpected PUT")
+func (f *fakeClient) PutObject(ctx context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	return f.put(ctx, in)
+}
+
+type readerAtOnly struct {
+	io.ReaderAt
+	size int64
+}
+
+func (r readerAtOnly) Size() int64 { return r.size }
+
+type conditionalConflict struct{}
+
+func (conditionalConflict) Error() string       { return "conditional conflict" }
+func (conditionalConflict) HTTPStatusCode() int { return 409 }
+
+func TestReaderAtUploadReplay(t *testing.T) {
+	const value = "the complete upload body"
+	attempts := 0
+	client := &fakeClient{put: func(_ context.Context, in *s3.PutObjectInput) (*s3.PutObjectOutput, error) {
+		attempts++
+		if aws.ToInt64(in.ContentLength) != int64(len(value)) || aws.ToString(in.IfNoneMatch) != "*" {
+			t.Fatal("incorrect length or conditional header")
+		}
+		if attempts == 1 {
+			if _, err := io.CopyN(io.Discard, in.Body, 5); err != nil {
+				t.Fatal(err)
+			}
+			return nil, conditionalConflict{}
+		}
+		body, err := io.ReadAll(in.Body)
+		if err != nil || string(body) != value {
+			t.Fatalf("retry body = %q, %v", body, err)
+		}
+		return &s3.PutObjectOutput{}, nil
+	}}
+	store, err := New(Config{Client: client, Bucket: "test-bucket"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(context.Background(), "key", readerAtOnly{strings.NewReader(value), int64(len(value))}); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d", attempts)
+	}
 }
 
 type trackedBody struct {
@@ -301,8 +346,19 @@ func TestGetWithoutContentLength(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := store.Get(context.Background(), "key"); err != nil || string(got) != "123456789" {
-		t.Fatalf("Get = %q, %v", got, err)
+	r, err := store.Get(context.Background(), "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body.closed {
+		t.Fatal("body closed before caller could read it")
+	}
+	got, err := io.ReadAll(r)
+	if err != nil || string(got) != "123456789" {
+		t.Fatalf("Read = %q, %v", got, err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
 	}
 	if !body.closed {
 		t.Fatal("body leaked")

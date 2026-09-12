@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -122,7 +123,7 @@ func TestAggregateValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, segRef := range []objectRef{old.commit.Frontier[0].Refs[0], snap.commit.Frontier[0].Refs[0]} {
-		raw, err := lg.decompress(s.objects[segRef.Key])
+		raw, err := lg.decompressBytes(s.objects[segRef.Key])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -155,7 +156,7 @@ func TestAggregateValidation(t *testing.T) {
 				ref := segRef
 				ref.SHA256 = digest(b)
 				ref.Key = lg.treeKey(ref)
-				if _, err := lg.decodeSegment(ref, compressTest(t, b)); !errors.Is(err, ErrCorrupt) {
+				if err := lg.decodeSegment(context.Background(), ref, bytes.NewReader(compressTest(t, b)), nil); !errors.Is(err, ErrCorrupt) {
 					t.Fatal(err)
 				}
 			})
@@ -165,7 +166,7 @@ func TestAggregateValidation(t *testing.T) {
 		ref := segRef
 		ref.SHA256 = digest(b)
 		ref.Key = lg.treeKey(ref)
-		if _, err := lg.decodeSegment(ref, compressTest(t, b)); !errors.Is(err, ErrCorrupt) {
+		if err := lg.decodeSegment(context.Background(), ref, bytes.NewReader(compressTest(t, b)), nil); !errors.Is(err, ErrCorrupt) {
 			t.Fatal(err)
 		}
 	}
@@ -174,21 +175,21 @@ func TestAggregateValidation(t *testing.T) {
 func TestDecompression(t *testing.T) {
 	lg := testLog[int](t, newStore())
 	valid := compressTest(t, []byte(`{"ok":true}`))
-	if raw, err := lg.decompress(valid); err != nil || string(raw) != `{"ok":true}` {
+	if raw, err := lg.decompressBytes(valid); err != nil || string(raw) != `{"ok":true}` {
 		t.Fatal(string(raw), err)
 	}
 	for name, b := range map[string][]byte{
 		"second frame": append(bytes.Clone(valid), valid...), "trailing byte": append(bytes.Clone(valid), 0), "truncated": valid[:len(valid)-1], "invalid": []byte("not zstd"),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := lg.decompress(b); !errors.Is(err, ErrCorrupt) {
+			if _, err := lg.decompressBytes(b); !errors.Is(err, ErrCorrupt) {
 				t.Fatal(err)
 			}
 		})
 	}
 	// Output may exceed both the batch admission limit and the compression window.
 	want := bytes.Repeat([]byte("a"), 2<<20)
-	if got, err := lg.decompress(compressTest(t, want)); err != nil || !bytes.Equal(got, want) {
+	if got, err := lg.decompressBytes(compressTest(t, want)); err != nil || !bytes.Equal(got, want) {
 		t.Fatalf("large output: %v", err)
 	}
 	// A streaming frame need not advertise its decompressed size.
@@ -203,7 +204,7 @@ func TestDecompression(t *testing.T) {
 	if err := enc.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := lg.decompress(buf.Bytes()); err != nil || !bytes.Equal(got, want) {
+	if got, err := lg.decompressBytes(buf.Bytes()); err != nil || !bytes.Equal(got, want) {
 		t.Fatalf("streaming frame: %v", err)
 	}
 }
@@ -310,7 +311,7 @@ type blockingGetStore struct {
 	started chan struct{}
 }
 
-func (s *blockingGetStore) Get(ctx context.Context, key string) ([]byte, error) {
+func (s *blockingGetStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	s.active.Add(1)
 	defer s.active.Add(-1)
 	s.started <- struct{}{}

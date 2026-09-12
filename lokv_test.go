@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"reflect"
 	"sort"
@@ -51,7 +52,7 @@ func (s *testStore) List(ctx context.Context, prefix string, limit int) ([]strin
 	return keys[:min(limit, len(keys))], nil
 }
 
-func (s *testStore) Get(ctx context.Context, key string) ([]byte, error) {
+func (s *testStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -63,12 +64,19 @@ func (s *testStore) Get(ctx context.Context, key string) ([]byte, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	return bytes.Clone(b), nil
+	return io.NopCloser(contextReader{ctx, bytes.NewReader(b)}), nil
 }
 
-func (s *testStore) Create(ctx context.Context, key string, body []byte) error {
+func (s *testStore) Create(ctx context.Context, key string, value SizeReaderAt) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	body, err := io.ReadAll(contextReader{ctx, io.NewSectionReader(value, 0, value.Size())})
+	if err != nil {
+		return err
+	}
+	if int64(len(body)) != value.Size() {
+		return io.ErrUnexpectedEOF
 	}
 	s.mu.Lock()
 	s.creates++
@@ -761,7 +769,7 @@ func TestFinalRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Create(ctx, lg.logKey(revision), body); err != nil {
+	if err := s.Create(ctx, lg.logKey(revision), bytes.NewReader(body)); err != nil {
 		t.Fatal(err)
 	}
 	final, err := lg.Append(ctx, 1)

@@ -4,7 +4,10 @@
 package lokv
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"testing"
 )
 
@@ -63,7 +66,7 @@ func FuzzSegmentDecoding(f *testing.F) {
 		}
 		ref := objectRef{2, hexRevision(1), hexRevision(256), "", digest(b), zeroHash, zeroHash}
 		ref.Key = lg.treeKey(ref)
-		_, _ = lg.decodeSegment(ref, compressTest(t, b))
+		_ = lg.decodeSegment(context.Background(), ref, bytes.NewReader(compressTest(t, b)), nil)
 	})
 }
 
@@ -78,10 +81,14 @@ func FuzzSegmentDecompression(f *testing.F) {
 		}
 		// Bound this fuzz workload, not production decoding. Unknown-size frames
 		// have deterministic coverage in TestDecompression.
-		h, err := singleFrame(b)
+		h, err := singleFrame(context.Background(), bytes.NewReader(b))
 		if err == nil && (!h.HasFCS || h.FrameContentSize > 1<<20) {
 			return
 		}
-		_, _ = lg.decompress(b)
+		dec, err := lg.decompress(context.Background(), bytes.NewReader(b))
+		if err == nil {
+			defer dec.Close()
+			_, _ = io.Copy(io.Discard, dec)
+		}
 	})
 }

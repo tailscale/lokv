@@ -9,7 +9,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -28,20 +30,20 @@ func Test(t *testing.T, store lokv.Store, prefix string) {
 	}
 	for _, suffix := range []string{"c", "a", "b", "aa"} {
 		body := []byte(suffix)
-		if err := store.Create(ctx, key(suffix), body); err != nil {
+		if err := store.Create(ctx, key(suffix), bytes.NewReader(body)); err != nil {
 			t.Fatal(err)
 		}
 		body[0] = '!'
-		actual, err := store.Get(ctx, key(suffix))
+		actual, err := readAll(ctx, store, key(suffix))
 		if err != nil || string(actual) != suffix {
 			t.Fatalf("visibility/ownership: %q, %v", actual, err)
 		}
 		actual[0] = '!'
-		actual, err = store.Get(ctx, key(suffix))
+		actual, err = readAll(ctx, store, key(suffix))
 		if err != nil || string(actual) != suffix {
 			t.Fatalf("GET ownership: %q, %v", actual, err)
 		}
-		if err := store.Create(ctx, key(suffix), []byte("overwrite")); !errors.Is(err, lokv.ErrExists) {
+		if err := store.Create(ctx, key(suffix), bytes.NewReader([]byte("overwrite"))); !errors.Is(err, lokv.ErrExists) {
 			t.Fatalf("duplicate: %v", err)
 		}
 	}
@@ -64,14 +66,14 @@ func Test(t *testing.T, store lokv.Store, prefix string) {
 		wg.Go(func() {
 			<-start
 			body := bytes.Repeat([]byte(fmt.Sprintf("%02d", i)), 32768)
-			err := store.Create(ctx, key("race"), body)
+			err := store.Create(ctx, key("race"), bytes.NewReader(body))
 			if err == nil {
 				wins.Add(1)
 			} else if !errors.Is(err, lokv.ErrExists) {
 				t.Errorf("race CREATE: %v", err)
 				return
 			}
-			actual, err := store.Get(ctx, key("race"))
+			actual, err := readAll(ctx, store, key("race"))
 			if err != nil || len(actual) != len(body) {
 				t.Errorf("race GET: length %d, %v", len(actual), err)
 				return
@@ -101,4 +103,78 @@ func Test(t *testing.T, store lokv.Store, prefix string) {
 	if err := store.Create(cancelled, key("cancelled"), nil); !errors.Is(err, context.Canceled) {
 		t.Errorf("CREATE cancellation: %v", err)
 	}
+	// A source can implement only ReaderAt and Size, with no sequential cursor.
+	source := readerAtOnly{strings.NewReader("streaming value"), int64(len("streaming value"))}
+	if err := store.Create(ctx, key("reader-at"), source); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Get(ctx, key("reader-at"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := store.Get(ctx, key("reader-at"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	var prefixBytes [3]byte
+	if _, err := io.ReadFull(first, prefixBytes[:]); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := io.ReadAll(second); err != nil || string(b) != "streaming value" {
+		t.Fatalf("Get readers share a cursor: %q, %v", b, err)
+	}
+	if b, err := io.ReadAll(first); err != nil || string(b) != "eaming value" {
+		t.Fatalf("first reader: %q, %v", b, err)
+	}
+	readCtx, cancelRead := context.WithCancel(ctx)
+	r, err := store.Get(readCtx, key("reader-at"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	cancelRead()
+	if _, err := r.Read(prefixBytes[:]); !errors.Is(err, context.Canceled) {
+		t.Fatalf("read after cancellation: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		body lokv.SizeReaderAt
+	}{
+		{"short-source", readerAtOnly{strings.NewReader("short"), 20}},
+		{"failed-source", readerAtOnly{failingReaderAt{}, 20}},
+	} {
+		if err := store.Create(ctx, key(tc.name), tc.body); err == nil {
+			t.Fatalf("accepted %s", tc.name)
+		}
+		if r, err := store.Get(ctx, key(tc.name)); !errors.Is(err, lokv.ErrNotFound) {
+			if r != nil {
+				r.Close()
+			}
+			t.Fatalf("published incomplete %s: %v", tc.name, err)
+		}
+	}
+}
+
+type readerAtOnly struct {
+	io.ReaderAt
+	size int64
+}
+
+func (r readerAtOnly) Size() int64 { return r.size }
+
+type failingReaderAt struct{}
+
+func (failingReaderAt) ReadAt([]byte, int64) (int, error) {
+	return 0, errors.New("test source failure")
+}
+
+func readAll(ctx context.Context, store lokv.Store, key string) ([]byte, error) {
+	r, err := store.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	b, readErr := io.ReadAll(r)
+	return b, errors.Join(readErr, r.Close())
 }
