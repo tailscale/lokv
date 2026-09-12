@@ -8,6 +8,8 @@ SPDX-License-Identifier: BSD-3-Clause
 
 # lokv (Log over K/V)
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/tailscale/lokv.svg)](https://pkg.go.dev/github.com/tailscale/lokv)
+
 lokv implements an append-only log over a sorted, create-only key/value store
 (e.g. S3, if so configured). Values are JSON, revisions are gap-free `int64`s
 starting at **1**, and every commit is a historical snapshot. Revisions are capped
