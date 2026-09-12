@@ -585,6 +585,65 @@ func TestConfiguration(t *testing.T) {
 	}
 }
 
+func TestPrefixLength(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		prefix string
+		valid  bool
+	}{
+		{"empty", "", true},
+		{"slashes", strings.Repeat("/", 1025), true},
+		{"ascii boundary", strings.Repeat("p", 906), true},
+		{"trimmed boundary", "//" + strings.Repeat("p", 906) + "//", true},
+		{"UTF-8 boundary", strings.Repeat("é", 453), true},
+		{"ascii too long", strings.Repeat("p", 907), false},
+		{"UTF-8 too long", strings.Repeat("é", 453) + "x", false},
+		{"first compaction regression", strings.Repeat("p", 950), false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newStore()
+			lg, err := Open[int](Config{Store: s, Prefix: tt.prefix})
+			if s.lists != 0 || s.gets != 0 || s.creates != 0 {
+				t.Fatal("Open performed store I/O")
+			}
+			if !tt.valid {
+				if err == nil || lg != nil {
+					t.Fatalf("Open accepted %d-byte prefix", len(tt.prefix))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, revision := range []int64{1, MaxRevision} {
+				if size := len(lg.logKey(revision)); size > 1024 {
+					t.Fatalf("commit key has %d bytes", size)
+				}
+			}
+			for level := uint8(1); level <= 13; level++ {
+				key := lg.treeKey(objectRef{
+					Level: level, Start: hexRevision(1),
+					End: hexRevision(int64(1) << (4 * level)), SHA256: zeroHash,
+				})
+				if size := len(key); size > 1024 || len(strings.Trim(tt.prefix, "/")) == 906 && size != 1024 {
+					t.Fatalf("level %d key has %d bytes", level, size)
+				}
+			}
+			// Enforce S3's key limit while actually creating the first aggregate.
+			s.before = func(key string, _ []byte) error {
+				if len(key) > 1024 {
+					return fmt.Errorf("key has %d bytes; maximum is 1024", len(key))
+				}
+				return nil
+			}
+			head := build(t, lg, 17)
+			if err := lg.Verify(context.Background(), head); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestLimits(t *testing.T) {
 	s := newStore()
 	lg, err := Open[string](Config{Store: s, MaxEventBytes: 8})

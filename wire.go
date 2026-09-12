@@ -20,6 +20,11 @@ const (
 	commitFormat  = "lokv/commit/v3"
 	segmentFormat = "lokv/segment/v3"
 	zeroHash      = "0000000000000000000000000000000000000000000000000000000000000000"
+
+	// Reserve the longest suffix, including the slash after a nonempty prefix,
+	// so every generated key fits S3's 1024-byte limit. Levels use one hex digit,
+	// revisions use 16 each, and the SHA-256 digest uses 64.
+	maxPrefixBytes = 1024 - (len("/v1/tree/f/") + 16 + 1 + 16 + 1 + 64 + len(".json.zst"))
 )
 
 type previous struct {

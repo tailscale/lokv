@@ -371,6 +371,9 @@ segment; there are no reference-only index objects. Commit keys and the record
 hash algorithm are unchanged.
 
 Prefix normalization strips leading and trailing slashes; empty prefixes work.
+`Open` rejects normalized prefixes longer than 906 UTF-8 bytes before any I/O.
+This reserves room for aggregate keys within S3's 1,024-byte key limit and
+applies to all stores, so a valid prefix cannot become too long at compaction.
 Invalid UTF-8, control characters, backslashes, and empty or dot path components
 are rejected. References must remain inside the normalized namespace.
 

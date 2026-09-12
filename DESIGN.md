@@ -524,6 +524,11 @@ None of these helpers waits for new records.
 advancing their checkpoint; if updates can fail or readers share the index, use
 an application transaction or lock to publish the whole batch consistently.
 
+`Open` rejects a normalized prefix longer than 906 UTF-8 bytes, reserving 118
+bytes for the longest generated key suffix within S3's 1024-byte key limit.
+This applies to every store and is checked before I/O, so aggregate keys cannot
+first exceed the key limit during compaction.
+
 `Open` rejects a nil store, malformed prefix, negative batch limits, and negative
 retry counts before performing I/O. Backend-specific configuration such as S3
 bucket, region, credentials, and SDK client belongs to the adapter constructor,

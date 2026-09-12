@@ -25,9 +25,22 @@ import (
 const MaxRevision int64 = 1<<53 - 1
 
 // Config selects the immutable namespace and resource limits. Zero limits use
-// defaults. Prefix is normalized by stripping leading and trailing slashes.
+// defaults.
 type Config struct {
-	Prefix             string
+	// Prefix optionally namespaces the log. It is often empty when an S3 bucket
+	// is dedicated to a single log. Use distinct prefixes to keep multiple logs
+	// in the same store. Leading and trailing slashes are stripped.
+	//
+	// The normalized prefix must be at most 906 UTF-8 bytes, leaving room for
+	// every generated key within S3's 1024-byte limit. This applies to all stores.
+	// It must be valid UTF-8 with no backslashes or Unicode control characters.
+	// If nonempty, it consists of slash-separated components; no component may
+	// be empty, ".", or "..". Other characters, including spaces, punctuation,
+	// and non-ASCII text, are allowed. Matching is literal and case-sensitive;
+	// no URL decoding, path cleaning, or Unicode normalization is performed.
+	// Open rejects invalid prefixes before any store I/O.
+	Prefix string
+
 	Store              Store
 	MaxConflictRetries int // Default 32; negative values are invalid. AppendTo never retries conflicts.
 
@@ -67,6 +80,9 @@ func Open[T any](cfg Config) (*Log[T], error) {
 		cfg.MaxEventBytes = 1 << 20
 	}
 	p := strings.Trim(cfg.Prefix, "/")
+	if len(p) > maxPrefixBytes {
+		return nil, fmt.Errorf("lokv: prefix is %d bytes; maximum is %d", len(p), maxPrefixBytes)
+	}
 	if !utf8.ValidString(p) || strings.ContainsAny(p, "\\") || strings.ContainsFunc(p, unicode.IsControl) {
 		return nil, errors.New("lokv: invalid prefix")
 	}
