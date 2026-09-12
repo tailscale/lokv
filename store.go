@@ -21,8 +21,7 @@ type SizeReaderAt interface {
 //
 // Create must atomically publish a complete value only if the key is absent,
 // with exactly one winner among concurrent creators. Successful creation must
-// be immediately visible to both Get and List. List must return globally
-// ascending bytewise keys for the requested prefix and honor its result limit.
+// be immediately visible to both Get and List.
 // The caller owns Get's reader and must close it. Create must not retain its
 // input after returning; the caller keeps the source open and unchanged until then.
 //
@@ -31,7 +30,9 @@ type SizeReaderAt interface {
 // preconditions. The s3store subpackage adapts general-purpose S3 buckets;
 // directory buckets are unsupported because their listing is unordered.
 type Store interface {
-	// List returns at most limit matching keys in ascending bytewise order.
+	// List returns the first at most limit keys beginning with prefix, in
+	// ascending bytewise order. Prefix matching is literal; an empty prefix
+	// matches all keys. Returned keys are complete, including the prefix.
 	// limit must be positive. A successful Create is immediately visible to List.
 	List(ctx context.Context, prefix string, limit int) ([]string, error)
 

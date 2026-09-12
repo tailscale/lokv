@@ -1,11 +1,6 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Package s3store adapts general-purpose Amazon S3 buckets to lokv.Store.
-// Every PUT uses If-None-Match: *. The bucket policy must deny deletes and
-// nonconditional writes, and lifecycle expiration must be disabled. Directory
-// buckets and eventually consistent or unordered S3-compatible services do not
-// satisfy the lokv storage contract.
 package s3store
 
 import (
