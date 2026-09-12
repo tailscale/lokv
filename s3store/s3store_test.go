@@ -129,7 +129,12 @@ func (a *httpAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func httpStore(t *testing.T, api *httpAPI) *Store {
 	t.Helper()
-	server := httptest.NewServer(api)
+	return storeForHandler(t, api)
+}
+
+func storeForHandler(t *testing.T, handler http.Handler) *Store {
+	t.Helper()
+	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	client := s3.NewFromConfig(aws.Config{Region: "us-east-1", Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
 		return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test"}, nil
@@ -269,6 +274,7 @@ func TestHTTPPagination(t *testing.T) {
 }
 
 type fakeClient struct {
+	Client
 	get  func(context.Context, *s3.GetObjectInput) (*s3.GetObjectOutput, error)
 	list func(context.Context, *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error)
 	put  func(context.Context, *s3.PutObjectInput) (*s3.PutObjectOutput, error)

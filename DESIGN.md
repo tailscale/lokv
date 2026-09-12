@@ -42,7 +42,7 @@ Appending usually writes only the new commit/head object. A hexadecimal carry
 writes one aggregate object per carried level before publishing the commit.
 The final commit `Store.Create` is the linearization point.
 
-Best case: **1 object creation per record** (one PUT with the S3 adapter).\
+Best case: **1 object creation per record** (one PUT for small S3 values).\
 Amortized: **`1 + 1/16 + 1/256 + ... = 16/15 ~= 1.0667 creations per record`**.
 
 All objects are written with the store's atomic create-if-absent operation. For
@@ -207,9 +207,10 @@ The first adapter should target a general-purpose Amazon S3 bucket:
 
 - `List` uses `ListObjectsV2` and requests `MaxKeys=limit`;
 - `Get` uses `GetObject` and returns its response body as an `io.ReadCloser`;
-- `Create` uses `PutObject` with `If-None-Match: *` and maps HTTP 412 to
-  `ErrExists`; HTTP 409 is retried as directed by S3. Each attempt gets a fresh
-  section reader and uses the explicit Size() as its content length;
+- `Create` uses `PutObject` for small values and multipart uploads for large
+  values. Both publication operations use `If-None-Match: *` and map HTTP 412
+  to `ErrExists`; HTTP 409 is retried as directed by S3. Each PUT or part gets a
+  section reader and an explicit content length;
 - S3 creation is atomic and subsequent GET/LIST operations are strongly
   consistent.
 
@@ -694,18 +695,25 @@ near-maximum 195-reference frontier can be tens of kilobytes per append.
 
 ## 13. S3 adapter: IAM and bucket configuration
 
-The S3 adapter must always send `If-None-Match: *`; IAM is defense in depth, not
-a substitute for correct adapter behavior.
+The S3 adapter must send `If-None-Match: *` when publishing an object, through
+either `PutObject` or `CompleteMultipartUpload`. Multipart initiation and part
+uploads do not publish objects and cannot use that condition. IAM is defense
+in depth, not a substitute for correct adapter behavior.
 
 Deployment requirements:
 
 1. Use a general-purpose bucket.
 2. Grant the writer only `s3:ListBucket` scoped by prefix plus `s3:GetObject` and
-   conditional `s3:PutObject` on the package prefix.
+   conditional `s3:PutObject` on the package prefix. Grant
+   `s3:AbortMultipartUpload` on the same objects for unfinished-upload cleanup.
 3. Do not grant `s3:DeleteObject`, `s3:DeleteObjectVersion`, or overwrite paths.
 4. Add an explicit bucket-policy deny for deletes on the prefix.
-5. Add a bucket-policy deny for object-creation PUTs missing `If-None-Match`.
-6. Do not configure lifecycle expiration on the prefix.
+5. Add a bucket-policy deny for object creation missing `If-None-Match`, using
+   `s3:ObjectCreationOperation` to exempt initiation and part uploads.
+6. Do not configure lifecycle expiration on the prefix. Configure
+   `AbortIncompleteMultipartUpload` to reclaim stranded uploads, with
+   `DaysAfterInitiation` longer than any expected upload (for example, seven
+   days). This does not expire completed objects.
 7. Prefer bucket-owner-enforced object ownership and no ACL headers.
 8. Optionally enable S3 Object Lock in compliance mode when immutability must
    survive credential or administrator compromise. Object Lock and conditional
@@ -740,10 +748,67 @@ account):
 }
 ```
 
-The adapter streams single-request `PutObject` from a section reader over the
-SizeReaderAt source. It does not impose its own object-size cap. Multipart
-support is separate future work; the compaction protocol does not bound
-upper-level sizes.
+The adapter uses single-request `PutObject` through 128 MiB and multipart above
+that threshold. The threshold is private and lowered in tests. Four workers
+stream parts directly from section readers over the `SizeReaderAt` source;
+neither entire objects nor entire parts are buffered. Part sizes start at
+64 MiB and grow to keep the upload within 10,000 parts. S3 permits parts from
+5 MiB through 5 GiB, with no minimum for the final part. CRC32 part checksums
+are carried into the ordered completion request as a composite checksum.
+These transfer choices do not change format v3, object keys, compressed bytes,
+or cold-read GET counts. Old readers can read objects uploaded with multipart.
+
+The SDK handles transport retries using seekable part readers. A conditional
+completion conflict (HTTP 409) requires aborting that upload and starting a new
+one, including reuploading all parts. HTTP 412 maps to `ErrExists`. Other
+completion errors, including a lost response followed by `NoSuchUpload`, are
+returned for the core's existing commit-ID/hash or aggregate-digest readback
+resolution. A completion error is never proof that the object was not published.
+
+On failure or cancellation, all local part workers finish before cleanup.
+Cleanup gets its own 30-second context, independent of caller cancellation.
+Abort failures are joined with the original error and prevent another conflict
+retry. A missing upload during abort is harmless: completion may already have
+consumed it. No cleanup path deletes a completed object. Lifecycle cleanup is
+still needed after crashes, lost initiation responses, and failed aborts.
+
+Local tests use `github.com/johannesboyne/gofakes3` with the AWS SDK. Its v1.2.0
+completion handler ignores `If-None-Match`, so a test HTTP shim supplies that
+precondition atomically across publications. Fault injection covers part
+replay, completion conflicts and embedded errors, cancellation, failed aborts,
+and lost completion responses. These tests do not qualify AWS IAM enforcement
+or replace the opt-in live S3 tests.
+
+### Beyond S3's object capacity
+
+Multipart removes the single-PUT ceiling but cannot exceed S3's physical
+capacity of 10,000 parts of 5 GiB each (about 48.8 TiB). The current adapter
+reports an error before starting an upload that cannot fit. This remains a
+growth limit for sufficiently large compactions; multipart alone does not
+complete the storage-layout work.
+
+The proposed next layout splits a logical packed segment's byte stream into
+large immutable chunks and publishes a small manifest only after every chunk
+exists. The manifest records ordered chunk keys, lengths, and content hashes,
+plus the logical segment's full digest and revision bounds. Readers concatenate
+and validate the chunks while streaming the logical segment. Larger levels
+still contain a full copy of their covered range, rather than references to
+individual commits or lower levels. Cold scans need one manifest GET and one
+GET per large chunk; they never expand into one GET per record.
+
+Chunks should use content-addressed keys within the log namespace and be
+created conditionally. Competing writers can reuse identical chunks. A failed
+writer can strand complete chunks before manifest publication; reclaiming
+those objects conflicts with the current no-delete policy, so automatic
+garbage collection is not part of this proposal. Chunk naming must also fit
+the existing key-length budget, or require a separately reviewed prefix change.
+
+This proposal is not implemented and no chunk manifests are written today.
+It requires a new wire version with an explicit manifest representation, not
+reinterpretation of existing v3 zstd objects. New readers must retain v3 support;
+old readers must reject the new version before following its references.
+Finalize and test this compatibility contract before enabling chunked writes.
+Batch admission limits must not be used to hide this remaining growth problem.
 
 ## 14. Limits and defensive decoding
 
@@ -866,8 +931,8 @@ The implementation is ready to hand off when:
 - normal appends issue exactly one `Store.Create`;
 - carries issue exactly `1 + carryDepth` object creations;
 - the core package depends only on `Store` and has no AWS SDK dependency;
-- no S3 adapter code path calls delete, copy, tagging mutation, or unconditional
-  PUT;
+- no S3 adapter code path deletes or mutates completed objects or publishes an
+  object unconditionally; aborts only discard unfinished multipart uploads;
 - a successful commit never references an object that was not created first;
 - head discovery uses one one-key forward lexical LIST;
 - historical and range scans return events in strictly increasing revision order;

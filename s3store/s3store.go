@@ -25,6 +25,10 @@ type Client interface {
 	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
 	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput, ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error)
+	UploadPart(context.Context, *s3.UploadPartInput, ...func(*s3.Options)) (*s3.UploadPartOutput, error)
+	CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput, ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
+	AbortMultipartUpload(context.Context, *s3.AbortMultipartUploadInput, ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
 }
 
 // Config contains backend settings; AWS credentials, region, and general
@@ -32,14 +36,17 @@ type Client interface {
 type Config struct {
 	Client             Client
 	Bucket             string
-	MaxConflictRetries int // Retries HTTP 409 conditional conflicts; default 8.
+	MaxConflictRetries int // retries HTTP 409 conditional conflicts; default 8
 }
 
-// Store implements lokv.Store without update, delete, or multipart methods.
+// Store implements lokv.Store using conditional S3 object creation.
 type Store struct {
 	client  Client
 	bucket  string
 	retries int
+
+	multipartThreshold int64 // use multipart above this size; lowered in tests
+	multipartPartSize  int64 // target part size; grows to stay within S3's part count
 }
 
 var _ lokv.Store = (*Store)(nil)
@@ -80,7 +87,11 @@ func New(cfg Config) (*Store, error) {
 	if cfg.MaxConflictRetries == 0 {
 		cfg.MaxConflictRetries = 8
 	}
-	return &Store{cfg.Client, b, cfg.MaxConflictRetries}, nil
+	return &Store{
+		client: cfg.Client, bucket: b, retries: cfg.MaxConflictRetries,
+		multipartThreshold: 128 << 20,
+		multipartPartSize:  64 << 20,
+	}, nil
 }
 
 func (s *Store) wrap(op, key string, err error) error {
@@ -158,9 +169,17 @@ func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return &responseBody{s: s, ctx: ctx, key: key, body: out.Body}, nil
 }
 
-// Create only performs conditional, single-request PUTs. HTTP 409 is retried
-// with bounded jitter; HTTP 412 maps to ErrExists. Other transport retries are
-// handled by the configured AWS SDK retryer.
+// Create uses PutObject for small values and multipart uploads for large ones.
+// Publication always uses If-None-Match: *. HTTP 412 maps to lokv.ErrExists;
+// HTTP 409 is retried with bounded jitter, restarting the entire upload for
+// multipart completion conflicts. Other transport retries are handled by the
+// configured AWS SDK retryer.
+//
+// Parts stream from value with bounded concurrency and no whole-part buffering.
+// Failed uploads are aborted using a separate, bounded cleanup context, even if
+// ctx was canceled. Cleanup errors are included in the returned error.
+// A lost completion response can leave a complete object despite an error;
+// lokv resolves ambiguous creation by reading and validating that object.
 func (s *Store) Create(ctx context.Context, key string, value lokv.SizeReaderAt) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -172,6 +191,9 @@ func (s *Store) Create(ctx context.Context, key string, value lokv.SizeReaderAt)
 	contentType := "application/json"
 	if strings.HasSuffix(key, ".zst") {
 		contentType = "application/zstd"
+	}
+	if size > s.multipartThreshold {
+		return s.createMultipart(ctx, key, value, size, contentType)
 	}
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -187,16 +209,23 @@ func (s *Store) Create(ctx context.Context, key string, value lokv.SizeReaderAt)
 		if status(err) != 409 && code(err) != "ConditionalRequestConflict" || attempt >= s.retries {
 			return s.wrap("put", key, err)
 		}
-		var jitter [1]byte
-		_, _ = rand.Read(jitter[:])
-		delay := (10 * time.Millisecond << min(attempt, 6)) * time.Duration(128+int(jitter[0])) / 256
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
+		if err := waitConflict(ctx, attempt); err != nil {
+			return err
 		}
+	}
+}
+
+func waitConflict(ctx context.Context, attempt int) error {
+	var jitter [1]byte
+	_, _ = rand.Read(jitter[:])
+	delay := (10 * time.Millisecond << min(attempt, 6)) * time.Duration(128+int(jitter[0])) / 256
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
