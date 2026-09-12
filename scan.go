@@ -54,7 +54,9 @@ func After(revision int64) Range {
 // that partially intersect the range. Disjoint subtrees are skipped.
 // Each callback receives one entire batch; ranges and revisions count batches,
 // not individual values within them. For N > 0 records, a full scan uses the sum
-// of the hexadecimal digits of N-1 Get calls, in addition to loading the snapshot.
+// of the hexadecimal digits of N-1 Get calls, in addition to loading the snapshot
+// (at most 75 Gets including the head for up to one million batches, excluding
+// retries).
 //
 // [State] manages an application's value and applied revision for catch-ups.
 // The follow example shows how to track them directly: keep the last successfully

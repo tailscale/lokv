@@ -713,7 +713,8 @@ For `N` appended batch records (regardless of the number of items per batch):
   each completed level; retained payload and compaction work grow with levels;
 - one current head/frontier is discoverable with one LIST plus one GET;
 - a full scan fetches each frontier object exactly once, plus the head;
-- for `N > 0`, the total GET count is `1 + sum(hex digits of N-1)`;
+- for `N > 0`, the total GET count is `1 + sum(hex digits of N-1)`
+  (at most 75 GETs including the head for up to one million batches);
 - at `N = 65537`, one level-4 segment plus the head needs two GETs;
 - at `N = 1000000`, the frontier has 15 level-4, 4 level-3, 2 level-2,
   3 level-1, and 15 level-0 references: 40 GETs including the head.
