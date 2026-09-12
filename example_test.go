@@ -13,18 +13,20 @@ import (
 
 func Example() {
 	ctx := context.Background()
-	log, err := lokv.Open[string](lokv.Config{Store: new(memstore.Store), Prefix: "audit"})
+	lg, err := lokv.Open[string](lokv.Config{Store: new(memstore.Store), Prefix: "audit"})
 	if err != nil {
 		panic(err)
 	}
-	var snapshot *lokv.Snapshot[string]
-	for _, event := range []string{"created", "updated", "archived"} {
-		snapshot, err = log.AppendTo(ctx, snapshot, event)
-		if err != nil {
-			panic(err)
-		}
+	// The first two values commit atomically at revision 1, in one object.
+	snapshot, err := lg.AppendTo(ctx, nil, "created", "updated")
+	if err != nil {
+		panic(err)
 	}
-	err = log.Scan(ctx, snapshot, lokv.All(), func(record lokv.Record[string]) error {
+	snapshot, err = lg.AppendTo(ctx, snapshot, "archived")
+	if err != nil {
+		panic(err)
+	}
+	err = lg.Scan(ctx, snapshot, lokv.All(), func(record lokv.Record[string]) error {
 		fmt.Println(record.Revision, record.Value)
 		return nil
 	})
@@ -32,7 +34,6 @@ func Example() {
 		panic(err)
 	}
 	// Output:
-	// 1 created
-	// 2 updated
-	// 3 archived
+	// 1 [created updated]
+	// 2 [archived]
 }

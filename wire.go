@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	commitFormat  = "lokv/commit/v1"
-	segmentFormat = "lokv/segment/v1"
+	commitFormat  = "lokv/commit/v2"
+	segmentFormat = "lokv/segment/v2"
 	indexFormat   = "lokv/index/v1"
 	zeroHash      = "0000000000000000000000000000000000000000000000000000000000000000"
 )
@@ -275,9 +275,13 @@ func (lg *Log[T]) validateProjection(p projection) (int64, error) {
 	if int64(len(p.Event)) > lg.maxEvent {
 		return 0, fmt.Errorf("%w: %w: event", ErrCorrupt, ErrTooLarge)
 	}
+	if len(p.Event) < 3 || p.Event[0] != '[' || p.Event[len(p.Event)-1] != ']' {
+		return 0, corrupt("event must be a nonempty batch array")
+	}
 	// RawMessage marshaling compacts and HTML-escapes its input. Requiring an
 	// event to be stable under this operation ensures packing never changes the
-	// authoritative bytes. Every json.Marshal(value) result has this property.
+	// authoritative bytes. Arrays assembled from json.Marshal items have this
+	// property.
 	canonical, err := json.Marshal(p.Event)
 	if err != nil || !bytes.Equal(canonical, p.Event) {
 		return 0, corrupt("noncanonical event JSON")

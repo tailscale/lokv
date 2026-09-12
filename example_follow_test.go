@@ -22,23 +22,22 @@ func ExampleLog_Scan_follow() {
 		Delete bool
 	}
 	ctx := context.Background()
-	log, err := lokv.Open[change](lokv.Config{Store: new(memstore.Store)})
+	lg, err := lokv.Open[change](lokv.Config{Store: new(memstore.Store)})
 	if err != nil {
 		panic(err)
 	}
-	appendChange := func(c change) {
-		if _, err := log.Append(ctx, c); err != nil {
+	appendChanges := func(value ...change) {
+		if _, err := lg.Append(ctx, value...); err != nil {
 			panic(err)
 		}
 	}
-	appendChange(change{Key: "alice", Value: "reader"})
-	appendChange(change{Key: "bob", Value: "reader"})
+	appendChanges(change{Key: "alice", Value: "reader"}, change{Key: "bob", Value: "reader"})
 
 	index := make(map[string]string)
 	var applied int64 // Zero means no records have been applied yet.
 	var indexedHead *lokv.Snapshot[change]
 	catchUp := func() error {
-		head, err := log.LoadHead(ctx)
+		head, err := lg.LoadHead(ctx)
 		if err != nil {
 			return err
 		}
@@ -46,14 +45,18 @@ func ExampleLog_Scan_follow() {
 			return fmt.Errorf("head moved behind applied revision %d", applied)
 		}
 		if head.Revision() > applied {
-			err = log.Scan(ctx, head, lokv.After(applied), func(r lokv.Record[change]) error {
-				if r.Value.Delete {
-					delete(index, r.Value.Key)
-				} else {
-					index[r.Value.Key] = r.Value.Value
+			err = lg.Scan(ctx, head, lokv.After(applied), func(r lokv.Record[change]) error {
+				// Only this goroutine accesses the index. If readers share it,
+				// hold their mutex across the entire batch and checkpoint update.
+				for _, c := range r.Value {
+					if c.Delete {
+						delete(index, c.Key)
+					} else {
+						index[c.Key] = c.Value
+					}
 				}
-				// Advance only after applying this record. If Scan later fails, the
-				// next catchUp resumes after the records already applied successfully.
+				// Advance only after applying the whole batch. If Scan later fails,
+				// the next catchUp resumes after the last successfully applied batch.
 				applied = r.Revision
 				return nil
 			})
@@ -75,17 +78,16 @@ func ExampleLog_Scan_follow() {
 
 	// Another writer appends. In a service, call catchUp from a single goroutine
 	// on a ticker tick or external wakeup. Neither Log nor Store provides Watch.
-	appendChange(change{Key: "alice", Value: "admin"})
-	appendChange(change{Key: "bob", Delete: true})
+	appendChanges(change{Key: "alice", Value: "admin"}, change{Key: "bob", Delete: true})
 	if err := catchUp(); err != nil {
 		panic(err)
 	}
-	// This scan applied only revisions 3 and 4; it did not replay 1 and 2.
+	// This scan applied only the batch at revision 2; it did not replay revision 1.
 	fmt.Println("caught up:", applied, index["alice"], len(index))
 
 	// A poll with no new entries still uses LoadHead's one List and one Get,
-	// but skips Scan. A poll with exactly one new entry needs no extra Get for
-	// Scan: the head already contains that entry. A larger catch-up reads only
+	// but skips Scan. A poll with exactly one new batch needs no extra Get for
+	// Scan: the head already contains that batch. A larger catch-up reads only
 	// intersecting tree objects; a packed segment may also contain older entries.
 	if err := catchUp(); err != nil {
 		panic(err)
@@ -93,27 +95,29 @@ func ExampleLog_Scan_follow() {
 	fmt.Println("unchanged:", indexedHead.Revision(), len(index))
 
 	// Output:
-	// initial: 2 reader reader
-	// caught up: 4 admin 1
-	// unchanged: 4 1
+	// initial: 1 reader reader
+	// caught up: 2 admin 1
+	// unchanged: 2 1
 }
 
 func ExampleLog_AppendTo() {
 	ctx := context.Background()
-	log, err := lokv.Open[string](lokv.Config{Store: new(memstore.Store)})
+	lg, err := lokv.Open[string](lokv.Config{Store: new(memstore.Store)})
 	if err != nil {
 		panic(err)
 	}
 
 	// Suppose each event reserves a name. Read the current log and decide
 	// whether "alice" is available against exactly this snapshot.
-	base, err := log.LoadHead(ctx)
+	base, err := lg.LoadHead(ctx)
 	if err != nil {
 		panic(err)
 	}
 	taken := make(map[string]bool)
-	err = log.Scan(ctx, base, lokv.All(), func(r lokv.Record[string]) error {
-		taken[r.Value] = true
+	err = lg.Scan(ctx, base, lokv.All(), func(r lokv.Record[string]) error {
+		for _, name := range r.Value {
+			taken[name] = true
+		}
 		return nil
 	})
 	if err != nil {
@@ -124,30 +128,34 @@ func ExampleLog_AppendTo() {
 	}
 
 	// Another writer wins after our read but before our write.
-	if _, err := log.Append(ctx, "alice"); err != nil {
+	if _, err := lg.Append(ctx, "alice"); err != nil {
 		panic(err)
 	}
-	_, err = log.AppendTo(ctx, base, "alice")
+	_, err = lg.AppendTo(ctx, base, "alice", "bob")
 	fmt.Println("must recheck:", errors.Is(err, lokv.ErrConflict))
 
 	// Catch up the index and recheck the decision instead of blindly retrying
 	// the reservation. For repeated catch-ups, use the Scan follow example.
-	head, err := log.LoadHead(ctx)
+	head, err := lg.LoadHead(ctx)
 	if err != nil {
 		panic(err)
 	}
-	err = log.Scan(ctx, head, lokv.After(base.Revision()), func(r lokv.Record[string]) error {
-		taken[r.Value] = true
+	err = lg.Scan(ctx, head, lokv.After(base.Revision()), func(r lokv.Record[string]) error {
+		for _, name := range r.Value {
+			taken[name] = true
+		}
 		return nil
 	})
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println("name already taken:", taken["alice"])
+	fmt.Println("bob reserved:", taken["bob"])
 	fmt.Println("committed reservations:", head.Revision())
 
 	// Output:
 	// must recheck: true
 	// name already taken: true
+	// bob reserved: false
 	// committed reservations: 1
 }

@@ -37,11 +37,12 @@ type Store interface {
 }
 
 var (
-	ErrNotFound  = errors.New("lokv: object not found")
-	ErrExists    = errors.New("lokv: object already exists")
-	ErrConflict  = errors.New("lokv: append conflict")
-	ErrCorrupt   = errors.New("lokv: corrupt log")
-	ErrRange     = errors.New("lokv: invalid range")
-	ErrTooLarge  = errors.New("lokv: object too large")
-	ErrExhausted = errors.New("lokv: revision space exhausted")
+	ErrNotFound   = errors.New("lokv: object not found")
+	ErrExists     = errors.New("lokv: object already exists")
+	ErrConflict   = errors.New("lokv: append conflict")
+	ErrCorrupt    = errors.New("lokv: corrupt log")
+	ErrRange      = errors.New("lokv: invalid range")
+	ErrTooLarge   = errors.New("lokv: object too large")
+	ErrExhausted  = errors.New("lokv: revision space exhausted")
+	ErrEmptyBatch = errors.New("lokv: empty batch")
 )

@@ -49,6 +49,8 @@ func After(revision int64) Range {
 // [After] to resume after an already-applied revision. Scan does not wait for
 // future records. It validates each fetched object, including complete segments
 // that partially intersect the range. Disjoint subtrees are skipped.
+// Each callback receives one entire batch; ranges and revisions count batches,
+// not individual values within them.
 //
 // The follow example shows an initial full scan into an in-memory index and
 // later catch-up scans. Keep the last successfully applied revision and scan
@@ -59,8 +61,9 @@ func After(revision int64) Range {
 // records were already applied; only requested records reach yield.
 //
 // Successfully yielded records are not rolled back if a later read or callback
-// fails. Advance an application's last-applied revision only after its update
-// succeeds, and keep it consistent with the application's index on retries.
+// fails. Advance an application's last-applied revision only after the entire
+// batch succeeds, and keep it consistent with the application's index on retries.
+// Applications must provide any atomicity needed for their own index updates.
 func (lg *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield func(Record[T]) error) error {
 	if err := ctx.Err(); err != nil {
 		return err

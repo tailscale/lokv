@@ -8,14 +8,14 @@ SPDX-License-Identifier: BSD-3-Clause
 Status: implementation specification\
 Target language: Go\
 Working package name: `lokv`\
-Wire format: `lokv/v1`
+Key layout: `lokv/v1`; commit and segment envelopes: v2; index envelopes: v1
 
 ## 1. Summary
 
 lokv (Log over K/V) implements an append-only log over a sorted, create-only
 key/value store (e.g. S3, if so configured). This generic Go library stores values
-of type `T` in revision order. Each `T` is encoded with
-`encoding/json` and embedded in an immutable commit object. Amazon S3 is the
+of type `T` in revision order. Each nonempty batch of `T` values is encoded as
+a JSON array and embedded in one immutable commit object. Amazon S3 is the
 first concrete adapter, not part of the core API.
 
 The commit object for a record is also the root manifest for the complete log at
@@ -53,8 +53,8 @@ overwritten or deleted by this library.
 
 ## 2. Goals
 
-1. Store an arbitrary Go value `T` for which `json.Marshal` and `json.Unmarshal`
-   work.
+1. Atomically store nonempty batches of arbitrary Go values `T` for which
+   `json.Marshal` and `json.Unmarshal` work.
 2. Give committed records a gap-free `int64` revision starting at 1.
 3. Find the latest committed revision with one `LIST` returning at most one key.
 4. Use one object creation for an append that causes no radix carry.
@@ -90,10 +90,14 @@ overwritten or deleted by this library.
   or 2^53 - 1). Revision 1 is the first record; values outside this range are
   invalid. Zero is reserved for empty-snapshot accessors. The cap equals
   JavaScript's `Number.MAX_SAFE_INTEGER` so revisions remain exact when passed
-  through JavaScript Numbers.
+  through JavaScript Numbers. Each revision identifies one entire batch, so
+  `MaxRevision` limits batch records rather than individual values.
+
+`record`
+: One nonempty, ordered batch of values, its revision, commit ID, and hash.
 
 `commit`
-: The immutable `v1/log/...json` object containing one event and the radix
+: The immutable `v1/log/...json` object containing one batch and the radix
   frontier for all records before it. A commit is also a historical root.
 
 `head`
@@ -262,14 +266,14 @@ characters.
 
 ```json
 {
-  "format": "lokv/commit/v1",
+  "format": "lokv/commit/v2",
   "revision": "0000000000000011",
   "commit_id": "66b7d24d9d8c4f519b8c126e486fa953",
   "previous": {
     "key": "v1/log/7fffffffffffffef.json",
     "record_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
   },
-  "event": {"example": "the generic T appears here"},
+  "event": [{"example": "the generic T appears here"}],
   "record_hash": "89abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
   "frontier": [
     {
@@ -299,9 +303,16 @@ Generate it once per public `Append` call and reuse it through retries. It lets
 the caller distinguish an ambiguously successful PUT from another writer's
 winning object at the same revision.
 
-`event` is the exact output of `json.Marshal(value)`, embedded as
-`json.RawMessage`. Marshal it once before any S3 operation and reuse those bytes
-for all retries.
+`event` is a nonempty JSON array, embedded as `json.RawMessage`, even for a
+single-item batch. Marshal each item with `json.Marshal`, then join the encoded
+items with commas inside square brackets. This also gives `Log[byte]` an outer
+array instead of `encoding/json`'s special base64 encoding of `[]byte`.
+Marshal the whole batch before any S3 operation and reuse its bytes for all
+retries. `MaxEventBytes` limits the complete array, including punctuation.
+
+Commit and segment format markers are v2. Reject old v1 envelopes, including
+old array-valued events that could otherwise be mistaken for multiple items.
+The v1 key layout, index format, and record hash algorithm remain unchanged.
 
 ### 7.2 Logical record hash
 
@@ -350,7 +361,7 @@ A level-1 segment contains exactly 16 record projections in revision order:
 
 ```json
 {
-  "format": "lokv/segment/v1",
+  "format": "lokv/segment/v2",
   "level": 1,
   "start": "0000000000000001",
   "end": "0000000000000010",
@@ -360,7 +371,7 @@ A level-1 segment contains exactly 16 record projections in revision order:
       "commit_id": "<32 hex>",
       "previous_record_hash": "<64 hex>",
       "record_hash": "<64 hex>",
-      "event": {"example": 0}
+      "event": [{"example": 0}]
     }
   ]
 }
@@ -408,7 +419,7 @@ type Config struct {
 
     Store Store
 
-    // Defaults: 32 retries, 1 MiB event JSON, 64 MiB uncompressed segment,
+    // Defaults: 32 retries, 1 MiB batch JSON array, 64 MiB uncompressed segment,
     // 256 MiB compressed-input/decompression safety ceiling as appropriate.
     MaxConflictRetries int
     MaxEventBytes      int64
@@ -432,15 +443,15 @@ type RecordHash [32]byte
 type Record[T any] struct {
     Revision   int64 // Valid from 1 through MaxRevision.
     CommitID   CommitID
-    Value      T
+    Value      []T // Nonempty batch, in append argument order.
     RecordHash RecordHash
 }
 
 // Head returns (zero, false, nil) for an empty log.
 func (lg *Log[T]) Head(ctx context.Context) (_ Record[T], ok bool, _ error)
 
-// Append marshals value once, discovers HEAD, and retries optimistic conflicts.
-func (lg *Log[T]) Append(ctx context.Context, value T) (Record[T], error)
+// Append atomically commits a batch at one revision, retrying conflicts.
+func (lg *Log[T]) Append(ctx context.Context, value ...T) (Record[T], error)
 
 // Snapshot is an opaque loaded historical root. A nil Snapshot means empty.
 type Snapshot[T any] struct { /* exported accessors, private frontier */ }
@@ -451,7 +462,7 @@ func (lg *Log[T]) LoadRevision(ctx context.Context, revision int64) (*Snapshot[T
 // AppendTo attempts exactly one successor of base. It returns ErrConflict if
 // another writer wins. This avoids an extra LIST/GET when a caller already owns
 // a fresh snapshot.
-func (lg *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value T) (*Snapshot[T], error)
+func (lg *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value ...T) (*Snapshot[T], error)
 
 type Range struct {
     First int64 // inclusive, in [1, MaxRevision]
@@ -480,6 +491,7 @@ var (
     ErrRange      = errors.New("lokv: invalid range")
     ErrTooLarge   = errors.New("lokv: object too large")
     ErrExhausted  = errors.New("lokv: revision space exhausted")
+    ErrEmptyBatch = errors.New("lokv: empty batch")
 )
 ```
 
@@ -494,6 +506,10 @@ checkpoint. `After(0)` covers the whole log and `After(MaxRevision)` returns the
 empty zero `Range`. Invalid inputs produce invalid ranges, rejected by `Scan`.
 None of these helpers waits for new records.
 
+`Scan` yields one whole batch per callback. Applications apply every item before
+advancing their checkpoint; if updates can fail or readers share the index, use
+an application transaction or lock to publish the whole batch consistently.
+
 `Open` rejects a nil store, malformed prefix, invalid size limits, and negative
 retry counts before performing I/O. Backend-specific configuration such as S3
 bucket, region, credentials, and SDK client belongs to the adapter constructor,
@@ -503,7 +519,8 @@ not `lokv.Config`.
 
 ### 9.1 Empty log
 
-1. Marshal `T`; reject marshal errors and size violations before store writes.
+1. Reject an empty batch with `ErrEmptyBatch`. Marshal the batch's items into an
+   array; reject marshal errors and size violations before store I/O.
 2. Generate one commit ID.
 3. Build revision-1 commit with no predecessor and empty frontier.
 4. `Store.Create(logKey(1), body)`.
@@ -540,7 +557,7 @@ for level = 0; ; level++ {
 }
 
 validateCanonicalFrontier(frontier, R+1)
-newCommit = commit(revision=R+1, previous=oldHead, frontier=frontier, event=T)
+newCommit = commit(revision=R+1, previous=oldHead, frontier=frontier, event=batch)
 store.Create(logKey(R+1), newCommit) // publish last
 ```
 
@@ -553,7 +570,8 @@ but correctness must not depend on it.
 Aggregate writes are also conditional creates. If `Create` returns `ErrExists`, GET
 and validate it, then treat it as success. Concurrent writers based on the same
 head construct the same carry aggregates, so they normally converge on identical
-content-addressed keys. The final deterministic revision key selects one event.
+content-addressed keys. The final deterministic revision key selects one whole
+batch.
 
 On `ErrExists` for the final commit:
 
@@ -632,7 +650,7 @@ a common-case PUT and still would not provide a multi-key transaction.
 
 ## 12. Storage and request cost
 
-For `N` appended records:
+For `N` appended batch records (regardless of the number of items per batch):
 
 - commit creations: `N`;
 - level-1 segment creations: approximately `N/16`;
@@ -710,7 +728,9 @@ in v1. This keeps conditional-create behavior and failure handling simple.
 - Reject revisions outside `[1, MaxRevision]` in stored data with `ErrCorrupt`.
 - Reject invalid UTF-8 only as `encoding/json` normally handles it; the exact
   marshaled bytes are authoritative.
-- Limit event JSON before upload.
+- Reject empty append batches with `ErrEmptyBatch` before store I/O.
+- Require every stored event to be a nonempty JSON array.
+- Limit the complete batch's JSON array before upload.
 - Limit commit/node response bodies while reading.
 - Limit both compressed and decompressed segment sizes and reject trailing zstd
   streams or trailing non-whitespace JSON.

@@ -182,7 +182,7 @@ func TestBoundariesAndCounts(t *testing.T) {
 				}
 				return
 			}
-			if head.Revision != int64(n) || head.Value != n-1 {
+			if head.Revision != int64(n) || len(head.Value) != 1 || head.Value[0] != n-1 {
 				t.Fatal(head)
 			}
 			var got []int
@@ -190,7 +190,7 @@ func TestBoundariesAndCounts(t *testing.T) {
 				if r.Revision != int64(len(got)+1) {
 					t.Fatal("unordered scan")
 				}
-				got = append(got, r.Value)
+				got = append(got, r.Value...)
 				return nil
 			})
 			if err != nil || len(got) != n {
@@ -249,7 +249,7 @@ func roundTrip[T any](t *testing.T, value T) {
 		t.Fatal(err)
 	}
 	if err := lg.Scan(context.Background(), snap, Range{1, 17}, func(r Record[T]) error {
-		if !reflect.DeepEqual(r.Value, value) {
+		if !reflect.DeepEqual(r.Value, []T{value}) {
 			t.Fatalf("round trip: %#v != %#v", r.Value, value)
 		}
 		return nil
@@ -266,6 +266,8 @@ func TestGenericJSON(t *testing.T) {
 	roundTrip(t, map[string]any{"number": float64(4), "nil": nil})
 	roundTrip(t, "a\n<&>\u2028")
 	roundTrip(t, number(3))
+	roundTrip(t, byte(255))
+	roundTrip(t, []byte{1, 2, 255})
 	roundTrip(t, []string{"a", "b"})
 	v := 7
 	roundTrip(t, &v)
@@ -277,7 +279,7 @@ func TestGenericJSON(t *testing.T) {
 func TestMarshalFailureNoIO(t *testing.T) {
 	s := newStore()
 	lg := testLog[any](t, s)
-	if _, err := lg.Append(context.Background(), func() {}); err == nil {
+	if _, err := lg.Append(context.Background(), 1, func() {}); err == nil {
 		t.Fatal("marshal succeeded")
 	}
 	if s.creates+s.gets+s.lists != 0 {
@@ -298,7 +300,7 @@ func TestConcurrentAppend(t *testing.T) {
 			for i := 0; i < n; i++ {
 				wg.Go(func() {
 					<-start
-					if _, err := lg.Append(context.Background(), i); err != nil {
+					if _, err := lg.Append(context.Background(), i, i+n); err != nil {
 						t.Errorf("append: %v", err)
 					}
 				})
@@ -314,10 +316,13 @@ func TestConcurrentAppend(t *testing.T) {
 			}
 			seen := map[int]bool{}
 			err = lg.Scan(context.Background(), snap, Range{1, int64(n)}, func(r Record[int]) error {
-				if seen[r.Value] {
+				if len(r.Value) != 2 || r.Value[1] != r.Value[0]+n {
+					t.Fatal("batch was split or mixed with another writer")
+				}
+				if seen[r.Value[0]] {
 					t.Error("duplicate input")
 				}
-				seen[r.Value] = true
+				seen[r.Value[0]] = true
 				return nil
 			})
 			if err != nil || len(seen) != n {
@@ -360,8 +365,8 @@ func TestAmbiguousSuccess(t *testing.T) {
 			lg := testLog[int](t, s)
 			build(t, lg, 16)
 			s.after = func(string, []byte) error { return reported }
-			r, err := lg.Append(context.Background(), 42)
-			if err != nil || r.Revision != 17 {
+			r, err := lg.Append(context.Background(), 42, 43)
+			if err != nil || r.Revision != 17 || !reflect.DeepEqual(r.Value, []int{42, 43}) {
 				t.Fatalf("append: %v %v", r, err)
 			}
 			snap, err := lg.LoadHead(context.Background())
@@ -649,7 +654,7 @@ func TestMarshalOnceAcrossConflict(t *testing.T) {
 			t.Fatal(err)
 		}
 		c.CommitID = strings.Repeat("a", 32)
-		c.Event = json.RawMessage("99")
+		c.Event = json.RawMessage("[99]")
 		c.RecordHash = recordHash(1, c.CommitID, zeroHash, c.Event)
 		b, _ := json.Marshal(c)
 		s.mu.Lock()
@@ -657,18 +662,18 @@ func TestMarshalOnceAcrossConflict(t *testing.T) {
 		s.mu.Unlock()
 		return ErrExists
 	}
-	r, err := lg.Append(context.Background(), countingJSON{7, &calls})
+	r, err := lg.Append(context.Background(), countingJSON{7, &calls}, countingJSON{8, &calls})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Revision != 2 || r.Value.N != 7 || calls.Load() != 1 {
+	if r.Revision != 2 || len(r.Value) != 2 || r.Value[0].N != 7 || r.Value[1].N != 8 || calls.Load() != 2 {
 		t.Fatalf("%+v marshals %d", r, calls.Load())
 	}
 }
 
 func TestRecordHashVector(t *testing.T) {
-	got := recordHash(1, "000102030405060708090a0b0c0d0e0f", zeroHash, []byte(`{"test":true}`))
-	const want = "c19c4d0570fdd3e94626bfce80e0a13271f9856b82185f46d1a1003ab9f06e8d"
+	got := recordHash(1, "000102030405060708090a0b0c0d0e0f", zeroHash, []byte(`[{"test":true}]`))
+	const want = "1463a1d96fc2a96a9eec2aa9d6b10f1de120805e73aeeaf92a6a977873ef340c"
 	if got != want {
 		t.Fatalf("record hash %s", got)
 	}
@@ -751,7 +756,7 @@ func TestFinalRevision(t *testing.T) {
 		Revision: hexRevision(revision),
 		CommitID: strings.Repeat("0", 32),
 		Previous: &previous{lg.logKey(revision - 1), zeroHash},
-		Event:    json.RawMessage("0"),
+		Event:    json.RawMessage("[0]"),
 		Frontier: syntheticFrontier(lg, revision),
 	}
 	c.RecordHash = recordHash(revision, c.CommitID, zeroHash, c.Event)
@@ -783,7 +788,7 @@ func TestFinalRevision(t *testing.T) {
 	if err := lg.Scan(ctx, snap, Range{revision, MaxRevision}, func(r Record[int]) error { got = append(got, r); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0].Revision != revision || got[0].Value != 0 || got[1] != final {
+	if len(got) != 2 || got[0].Revision != revision || len(got[0].Value) != 1 || got[0].Value[0] != 0 || !reflect.DeepEqual(got[1], final) {
 		t.Fatalf("final range: %+v", got)
 	}
 	for _, tt := range []struct {
@@ -807,7 +812,7 @@ func TestFinalRevision(t *testing.T) {
 		}
 	}
 	loaded, err := lg.LoadRevision(ctx, MaxRevision)
-	if err != nil || loaded.Record() != final {
+	if err != nil || !reflect.DeepEqual(loaded.Record(), final) {
 		t.Fatalf("load final revision: %v", err)
 	}
 	before := s.creates + s.gets + s.lists

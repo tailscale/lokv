@@ -18,7 +18,7 @@ import (
 
 const safetyCeiling int64 = 256 << 20
 
-// MaxRevision is the maximum revision and maximum number of records in a log.
+// MaxRevision is the maximum revision and maximum number of batch records in a log.
 // It equals JavaScript's Number.MAX_SAFE_INTEGER (9007199254740991), so all valid
 // revisions can pass through JavaScript Numbers without losing precision.
 // Appending to a log at MaxRevision returns ErrExhausted.
@@ -30,7 +30,7 @@ type Config struct {
 	Prefix             string
 	Store              Store
 	MaxConflictRetries int   // Default 32; negative values are invalid. AppendTo never retries conflicts.
-	MaxEventBytes      int64 // Default 1 MiB of JSON.
+	MaxEventBytes      int64 // Default 1 MiB for the complete batch's JSON array.
 	MaxObjectBytes     int64 // Default 64 MiB, both stored and decompressed; at most 256 MiB.
 }
 
@@ -90,16 +90,17 @@ func Open[T any](cfg Config) (*Log[T], error) {
 type CommitID [16]byte
 
 // RecordHash is a record's logical SHA-256 hash. It covers the record's revision,
-// commit ID, predecessor's hash, and JSON-encoded event, linking it to its history.
+// commit ID, predecessor's hash, and JSON-encoded batch, linking it to its history.
 type RecordHash [32]byte
 
-// Record is a decoded log event and its identity.
+// Record is an atomically appended batch and its identity. Each successful append
+// creates one record and consumes one revision, regardless of the batch's size.
 type Record[T any] struct {
 	// Revision is the record's sequence number, from 1 through MaxRevision.
 	// Values <= 0 or > MaxRevision are invalid.
 	Revision   int64
 	CommitID   CommitID
-	Value      T
+	Value      []T // Nonempty, in append argument order.
 	RecordHash RecordHash
 }
 
@@ -122,9 +123,9 @@ type Snapshot[T any] struct {
 	record Record[T]
 }
 
-// Record returns the root's event, or a zero record for an empty snapshot.
-// As with ordinary Go values, maps, slices and pointers in Value are shallow
-// copies. Mutating them cannot change the stored event or future appends/scans.
+// Record returns the root's batch, or a zero record for an empty snapshot.
+// Value and any maps, slices, or pointers within it are shallow copies. Mutating
+// them cannot change the stored batch or future appends/scans.
 func (s *Snapshot[T]) Record() Record[T] {
 	if s == nil {
 		return Record[T]{}
@@ -261,7 +262,7 @@ func (lg *Log[T]) LoadRevision(ctx context.Context, revision int64) (*Snapshot[T
 	return lg.snapshot(key, b)
 }
 
-// Head returns the latest event. ok reports whether a record was returned.
+// Head returns the latest batch. ok reports whether a record was returned.
 // An empty log returns (zero, false, nil).
 func (lg *Log[T]) Head(ctx context.Context) (_ Record[T], ok bool, _ error) {
 	s, err := lg.LoadHead(ctx)
@@ -271,14 +272,27 @@ func (lg *Log[T]) Head(ctx context.Context) (_ Record[T], ok bool, _ error) {
 	return s.Record(), true, nil
 }
 
-func (lg *Log[T]) prepare(value T) (json.RawMessage, string, error) {
-	b, err := json.Marshal(value)
-	if err != nil {
-		return nil, "", &eventCodecError{"marshal", err}
+func (lg *Log[T]) prepare(value []T) (json.RawMessage, string, error) {
+	if len(value) == 0 {
+		return nil, "", ErrEmptyBatch
 	}
-	if int64(len(b)) > lg.maxEvent {
-		return nil, "", ErrTooLarge
+	// Marshal each item separately so even Log[byte] stores an array instead of
+	// encoding/json's special base64 representation for []byte.
+	b := []byte{'['}
+	for i, item := range value {
+		encoded, err := json.Marshal(item)
+		if err != nil {
+			return nil, "", &eventCodecError{"marshal", err}
+		}
+		if i != 0 {
+			b = append(b, ',')
+		}
+		if int64(len(b))+int64(len(encoded))+1 > lg.maxEvent {
+			return nil, "", ErrTooLarge
+		}
+		b = append(b, encoded...)
 	}
+	b = append(b, ']')
 	var id CommitID
 	if _, err := rand.Read(id[:]); err != nil {
 		return nil, "", fmt.Errorf("lokv: generate commit ID: %w", err)
@@ -286,11 +300,15 @@ func (lg *Log[T]) prepare(value T) (json.RawMessage, string, error) {
 	return b, hex.EncodeToString(id[:]), nil
 }
 
-// Append marshals once and retries optimistic conflicts with the same commit ID.
+// Append atomically appends value as one batch, preserving argument order. It
+// marshals each item once and retries conflicts with the same batch and commit ID.
+// An empty batch returns ErrEmptyBatch without store I/O. MaxEventBytes limits
+// the complete JSON array. An ordinary append creates one object for the batch;
+// a radix carry may create additional aggregate objects for preceding records.
 // The first record has revision 1. Appending after [MaxRevision] returns ErrExhausted.
 // Transport retries belong to the adapter. An unresolved transport error is
 // returned, since the core cannot classify arbitrary backend errors as retryable.
-func (lg *Log[T]) Append(ctx context.Context, value T) (Record[T], error) {
+func (lg *Log[T]) Append(ctx context.Context, value ...T) (Record[T], error) {
 	if err := ctx.Err(); err != nil {
 		return Record[T]{}, err
 	}
@@ -313,10 +331,12 @@ func (lg *Log[T]) Append(ctx context.Context, value T) (Record[T], error) {
 	}
 }
 
-// AppendTo appends value only if base is still the current head when the commit
-// is created. A nil base means the log must still be empty; its successor has
-// revision 1. If another writer has advanced the log, AppendTo returns ErrConflict
-// without appending value. A base at [MaxRevision] returns ErrExhausted.
+// AppendTo atomically appends value as one batch only if base is still the current
+// head when the commit is created. A nil base means the log must still be empty;
+// its successor has revision 1. If another writer has advanced the log, AppendTo
+// returns ErrConflict without appending any item. A base at [MaxRevision] returns
+// ErrExhausted. An empty batch returns ErrEmptyBatch. As with [Log.Append], the
+// batch occupies one revision, and MaxEventBytes limits its complete JSON array.
 //
 // Use AppendTo when choosing value depends on the log's state. For example,
 // scan a snapshot into an index of reserved names, check that a name is free,
@@ -329,7 +349,7 @@ func (lg *Log[T]) Append(ctx context.Context, value T) (Record[T], error) {
 // it as the next base. Reusing a loaded or returned snapshot avoids the List and
 // head Get performed by Append; carries may still read historical objects. Both
 // base and the returned snapshot remain immutable historical views.
-func (lg *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value T) (*Snapshot[T], error) {
+func (lg *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value ...T) (*Snapshot[T], error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

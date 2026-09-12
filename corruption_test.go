@@ -265,7 +265,7 @@ func TestRevisionBeyondMaximum(t *testing.T) {
 		Revision: hexRevision(revision),
 		CommitID: strings.Repeat("0", 32),
 		Previous: &previous{lg.logKey(revision - 1), zeroHash},
-		Event:    json.RawMessage("0"),
+		Event:    json.RawMessage("[0]"),
 		Frontier: syntheticFrontier(lg, revision),
 	}
 	c.RecordHash = recordHash(revision, c.CommitID, zeroHash, c.Event)
@@ -395,13 +395,13 @@ func TestSnapshotValueMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Record().Value["x"] = 99
+	s.Record().Value[0]["x"] = 99
 	next, err := lg.AppendTo(context.Background(), s, map[string]int{"x": 2})
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = lg.Scan(context.Background(), next, Range{1, 2}, func(r Record[map[string]int]) error {
-		if r.Value["x"] != int(r.Revision) {
+		if r.Value[0]["x"] != int(r.Revision) {
 			t.Fatal("snapshot mutation changed wire data")
 		}
 		return nil
@@ -414,7 +414,7 @@ func TestSnapshotValueMutation(t *testing.T) {
 func TestRequiredGenesisFields(t *testing.T) {
 	lg := testLog[int](t, newStore())
 	s := build(t, lg, 1)
-	for _, part := range []string{`"previous":null,`, `"event":0,`, `"frontier":[]`} {
+	for _, part := range []string{`"previous":null,`, `"event":[0],`, `"frontier":[]`} {
 		body := strings.Replace(string(s.body), part, "", 1)
 		// Removing the final field needs its preceding comma removed as well.
 		body = strings.Replace(body, ",}", "}", 1)
@@ -444,18 +444,18 @@ func TestEventBytesAndCaseAliases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, event := range []json.RawMessage{json.RawMessage(`"<"`), json.RawMessage(`{ "x": 1 }`)} {
+	for _, event := range []json.RawMessage{json.RawMessage(`["<"]`), json.RawMessage(`[{ "x": 1 }]`)} {
 		c := *s.commit
 		c.Event = event
 		c.RecordHash = recordHash(1, c.CommitID, zeroHash, c.Event)
 		// Build the noncanonical envelope without RawMessage marshaling normalizing it.
-		b := bytes.Replace(s.body, []byte(`"safe"`), event, 1)
+		b := bytes.Replace(s.body, []byte(`["safe"]`), event, 1)
 		b = bytes.Replace(b, []byte(s.commit.RecordHash), []byte(c.RecordHash), 1)
 		if _, err := lg.decodeCommit(lg.logKey(1), b); !errors.Is(err, ErrCorrupt) {
 			t.Fatal(err)
 		}
 	}
-	b := append([]byte(`{"Format":"lokv/commit/v1",`), s.body[1:]...)
+	b := append([]byte(`{"Format":"lokv/commit/v2",`), s.body[1:]...)
 	if _, err := lg.decodeCommit(lg.logKey(1), b); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}

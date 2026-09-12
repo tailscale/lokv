@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -157,7 +158,7 @@ func TestHTTPHeadAndCarries(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 17; i++ {
-		if _, err := lg.Append(context.Background(), i); err != nil {
+		if _, err := lg.Append(context.Background(), i, i+100); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -165,11 +166,17 @@ func TestHTTPHeadAndCarries(t *testing.T) {
 	if err != nil || snap.Revision() != 17 {
 		t.Fatalf("head: %v", err)
 	}
+	if !slices.Equal(snap.Record().Value, []int{16, 116}) {
+		t.Fatalf("head batch: %v", snap.Record().Value)
+	}
 	if err := lg.Verify(context.Background(), snap); err != nil {
 		t.Fatal(err)
 	}
 	api.mu.Lock()
 	defer api.mu.Unlock()
+	if len(api.objects) != 18 {
+		t.Fatalf("34 values in 17 batches created %d objects; want 17 commits and 1 segment", len(api.objects))
+	}
 	for _, limit := range api.listLimits {
 		if limit != 1 {
 			t.Fatal("HEAD LIST MaxKeys was not 1")

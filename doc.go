@@ -7,9 +7,15 @@
 // the head with one limited LIST. A radix-16 frontier packs events once into zstd
 // segments, then builds reference-only index nodes.
 //
+// Each Record contains one nonempty batch of values. Append and AppendTo accept
+// variadic values, publish the entire batch atomically, and consume one revision
+// per call. Stored events are always JSON arrays, including single-item batches.
+// Scan yields a complete batch per callback. An empty append returns ErrEmptyBatch.
+//
 // Revisions are int64 sequence numbers from 1 through [MaxRevision] (2^53 - 1,
 // JavaScript's Number.MAX_SAFE_INTEGER). Values outside that range are invalid.
 // Empty snapshots report zero, and appending after MaxRevision returns ErrExhausted.
+// The cap counts batch records, not the individual values within them.
 //
 // Conditional commit creation serializes cooperating writers. Hashes detect
 // corruption, not malicious authorized writers. Append retains an invocation ID
