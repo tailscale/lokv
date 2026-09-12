@@ -345,11 +345,12 @@ func (lg *Log[T]) Append(ctx context.Context, value ...T) (Record[T], error) {
 // ErrExhausted. An empty batch returns ErrEmptyBatch. As with [Log.Append], the
 // batch occupies one revision, and MaxEventBytes limits its complete JSON array.
 //
-// Use AppendTo when choosing value depends on the log's state. For example,
-// scan a snapshot into an index of reserved names, check that a name is free,
-// then append its reservation against that same snapshot. On ErrConflict, catch
-// up and check again: another writer may have reserved the name. [Log.Append]
-// automatically retries the same value, so it cannot recheck that decision.
+// Use AppendTo for optimistic concurrency control when choosing value depends
+// on the log's state. For example, scan a snapshot into an index of reserved
+// names, check that a name is free, then append its reservation against that same
+// snapshot. On ErrConflict, catch up and check again: another writer may have
+// reserved the name. [Log.Append] automatically retries the same value, so it
+// cannot recheck that decision.
 // [State.Sync] maintains such an index and returns a snapshot suitable as the
 // base. The State example demonstrates unique username registration and user ID
 // allocation, including recomputing both decisions after a conflict.

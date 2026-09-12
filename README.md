@@ -15,6 +15,10 @@ at `lokv.MaxRevision` (**9,007,199,254,740,991**, or 2^53 - 1), JavaScript's
 `Number.MAX_SAFE_INTEGER`, so they remain exact when passed through JavaScript
 Numbers. Revisions outside `1..MaxRevision` are invalid.
 
+lokv supports **event sourcing**: use the log as the source of truth and replay
+its events to build application state. `State[T, S]` maintains that state as an
+in-memory **projection**, also called a **materialized view**.
+
 Each record is an atomic batch: `Record[T].Value` is a nonempty `[]T`, and
 `Append(ctx, a, b, c)` commits all three values in argument order at one revision.
 A batch uses one commit object, with extra aggregate objects only on a radix
@@ -76,6 +80,26 @@ immediately. `Verify` scans all records and reachable tree objects; verifying an
 empty snapshot succeeds. Loading validates the root locally, while scans validate
 the objects they fetch. Verification does not inventory unreachable objects or
 superseded raw commits.
+
+## Event sourcing and projections
+
+For readers familiar with event sourcing, the terminology maps to lokv as follows:
+
+| Term | lokv API |
+| --- | --- |
+| Event log | `Log[T]`, used as the application's source of truth |
+| Event | One `T` value; `Record[T]` contains an atomic batch of events |
+| Projection / materialized view | The application value `S` maintained by `State[T, S]` |
+| Event handler / reducer | The `func(*S, T) error` callback passed to `LoadState` |
+| Projection position | `State.Revision()`, the last fully applied batch's revision |
+| Optimistic concurrency control | `AppendTo` commits only if its base snapshot is still current |
+
+In the [username registration example](example_state_test.go), a
+`userRegistration` is an event, `userIndex` is the projection, and its `apply`
+method is the event handler. `LoadState` builds the projection by replaying the
+log; `Sync` applies newer events on later calls. `AppendTo` lets a registration
+decision based on that projection commit only if another writer has not advanced
+the log. On conflict, the client syncs and recomputes the decision.
 
 ## Following the log with an in-memory index
 
@@ -190,11 +214,12 @@ last-applied revision and range-scan pattern.
 
 ## Making decisions against an indexed snapshot
 
-`AppendTo` makes a write conditional on the snapshot used for the decision. For
-example, after catching up a name-reservation index, check that a name is free
-and call `AppendTo` with that exact snapshot. On `ErrConflict`, catch up and check
-again: another writer may have reserved the name in the meantime. `Append` retries
-the same batch automatically and cannot recheck application-specific conditions.
+`AppendTo` provides optimistic concurrency control by making a write conditional
+on the snapshot used for the decision. For example, after catching up a
+name-reservation index, check that a name is free and call `AppendTo` with that
+exact snapshot. On `ErrConflict`, catch up and check again: another writer may
+have reserved the name in the meantime. `Append` retries the same batch
+automatically and cannot recheck application-specific conditions.
 
 The [AppendTo example](example_follow_test.go) demonstrates that race. Keep the
 snapshot returned by a successful `AppendTo` for the next operation, and apply

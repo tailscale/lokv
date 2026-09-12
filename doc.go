@@ -3,6 +3,10 @@
 
 // Package lokv implements an append-only log over a sorted, create-only
 // key/value store (e.g. S3, if so configured). The name means Log over K/V.
+// It supports event sourcing: the log serves as the source of truth, and
+// application state is derived by replaying its events. Each T value is an event;
+// each [Record] holds an atomically appended batch of events.
+//
 // Each commit is a historical root; reverse revision keys discover
 // the head with one limited LIST. A radix-16 frontier packs complete record
 // ranges into zstd segments at every level: 16, 256, 4096 records, and so on.
@@ -31,11 +35,14 @@
 // Scan validates the objects it traverses, and Verify traverses the entire root.
 // Log methods may be called concurrently.
 //
-// [LoadState] builds an application-defined value or index by applying the whole
-// log one value at a time. [State.Sync] applies new batches and tracks the revision;
+// [LoadState] builds an in-memory projection, also called a materialized view,
+// by applying the whole log one value at a time. Its apply callback is the event
+// handler, sometimes called a reducer. [State.Sync] applies new batches, and
+// [State.Revision] tracks the projection's last fully applied batch.
 // [State.SyncTo] reuses an already-known snapshot. Applications arrange their
 // own polling or notifications. The State example maintains unique username and
-// user ID indexes, using [Log.AppendTo] to make registration conditional on the
-// snapshot used to build the indexes. State access requires caller synchronization.
+// user ID indexes, using [Log.AppendTo] for optimistic concurrency control:
+// registration commits only if the indexed snapshot is still current.
+// State access requires caller synchronization.
 // An apply error permanently poisons State; store errors remain resumable.
 package lokv

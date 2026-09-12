@@ -9,7 +9,8 @@ import (
 	"fmt"
 )
 
-// State maintains an application value S by applying records from a Log[T].
+// State maintains an in-memory projection (materialized view) S by applying
+// events from a Log[T]. This derives application state through event sourcing.
 // It tracks the last successfully applied revision, starting at zero for an
 // empty log. Construct a State with [LoadState]; its zero value is not usable.
 // An apply error permanently poisons the State; see [State.Err].
@@ -31,10 +32,11 @@ type State[T, S any] struct {
 // including any maps, slices, or pointers within it; it does not clone them.
 // Both lg and apply must be non-nil.
 //
-// apply receives a pointer to the application value and one T at a time, in
-// revision order and then append argument order within each batch. The applied
-// revision advances only after every item in a batch succeeds. Cancellation is
-// checked between batches, so it does not interrupt a partially applied batch.
+// apply is the event handler, sometimes called a reducer. It receives a pointer
+// to the application value and one T at a time, in revision order and then
+// append argument order within each batch. The applied revision advances only
+// after every item in a batch succeeds. Cancellation is checked between batches,
+// so it does not interrupt a partially applied batch.
 //
 // Any error returned by apply, including a context error, permanently poisons
 // the State. Updates already made by apply are not rolled back, including those
@@ -67,9 +69,9 @@ func LoadState[T, S any](ctx context.Context, lg *Log[T], initial S, apply func(
 // mutations from the failing apply call; it is invalid and must not be used.
 func (s *State[T, S]) Value() S { return s.value }
 
-// Revision returns the last successfully applied batch's revision, or zero if
-// no batch has been applied. A failing apply call does not advance this revision,
-// but leaves Value invalid; see [State.Err].
+// Revision returns the projection's position: the last successfully applied
+// batch's revision, or zero if no batch has been applied. A failing apply call
+// does not advance this revision, but leaves Value invalid; see [State.Err].
 func (s *State[T, S]) Revision() int64 { return s.revision }
 
 // Err returns the sticky apply error, or nil if the State has not been poisoned.
