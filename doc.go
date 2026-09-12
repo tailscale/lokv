@@ -31,8 +31,11 @@
 // Scan validates the objects it traverses, and Verify traverses the entire root.
 // Log methods may be called concurrently.
 //
-// The follow example for [Log.Scan] builds an in-memory index, then catches up
-// only new records after polling [Log.LoadHead]. Applications arrange their own
-// polling or notifications. [Log.AppendTo] can make a write conditional on the
-// snapshot used to build the index.
+// [LoadState] builds an application-defined value or index by applying the whole
+// log one value at a time. [State.Sync] applies new batches and tracks the revision;
+// [State.SyncTo] reuses an already-known snapshot. Applications arrange their
+// own polling or notifications. The State example maintains unique username and
+// user ID indexes, using [Log.AppendTo] to make registration conditional on the
+// snapshot used to build the indexes. State access requires caller synchronization.
+// An apply error permanently poisons State; store errors remain resumable.
 package lokv

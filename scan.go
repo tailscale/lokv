@@ -53,10 +53,11 @@ func After(revision int64) Range {
 // not individual values within them. For N > 0 records, a full scan uses the sum
 // of the hexadecimal digits of N-1 Get calls, in addition to loading the snapshot.
 //
-// The follow example shows an initial full scan into an in-memory index and
-// later catch-up scans. Keep the last successfully applied revision and scan
-// only the interval after it. Scan performs no List calls and does not refetch
-// the snapshot's own record: a range containing only that record needs no I/O.
+// [State] manages an application's value and applied revision for catch-ups.
+// The follow example shows how to track them directly: keep the last successfully
+// applied revision and scan only the interval after it. Scan performs no List
+// calls and does not refetch the snapshot's own record: a range containing only
+// that record needs no I/O.
 // Other reads are limited to intersecting packed segments and raw tail commits.
 // Every segment contains its complete range, even at higher levels, so each
 // intersecting frontier reference requires just one Get. A segment is read and

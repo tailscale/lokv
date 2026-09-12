@@ -79,20 +79,62 @@ superseded raw commits.
 
 ## Following the log with an in-memory index
 
-The executable [following example](example_follow_test.go) shows the complete
-pattern, also available as the follow example for `Log.Scan` in Go documentation:
+`LoadState` builds a `State[T, S]` by applying the whole log to your initial
+application value. Supply a function that mutates `*S` for one `T` value at a
+time. State handles iteration in revision order and append argument order within
+each batch. For example, count each event in the string log above:
 
-1. Start with an empty index and `applied = 0`.
-2. Call `LoadHead`, then `Scan` with `lokv.All()` to build the index.
-3. On each poll or wakeup, call `LoadHead` again. If its revision is greater than
-   `applied`, scan with `lokv.After(applied)` to apply only new records.
-4. Apply every item in `r.Value`, then advance `applied` to `r.Revision`. If a
-   scan fails partway through, resume after the last fully applied batch.
+```go
+state, err := lokv.LoadState(ctx, lg, make(map[string]int),
+    func(counts *map[string]int, event string) error {
+        (*counts)[event]++
+        return nil
+    })
+if err != nil { return err }
+fmt.Println(state.Revision(), state.Value())
 
-`After` handles both an empty index and a checkpoint at `MaxRevision` without
-caller-side arithmetic. A snapshot is a fixed upper bound: writes that arrive
-during a scan are picked up on the next catch-up. Scan yields only the requested
-records and performs no LIST operations.
+// On a poll or wakeup, apply only newly appended batches.
+if _, err := state.Sync(ctx); err != nil { return err }
+fmt.Println(state.Revision(), state.Value())
+```
+
+`Sync` returns the snapshot matching the updated state. When a write depends
+on the indexes, make the decision from `state.Value()` and pass that snapshot to
+`AppendTo`. On `ErrConflict`, catch up and recompute the decision. After a
+successful append, `state.SyncTo(ctx, newSnapshot)` applies the new batch with
+no store I/O. It also accepts snapshots obtained with `LoadHead` or `LoadRevision`.
+It rejects snapshots older than the applied revision and never rewinds state.
+
+The executable [username registration example](example_state_test.go), also
+available as the `State` example in Go documentation, maintains indexes in both
+directions between usernames and allocated user IDs. Each client has its own
+state. A competing writer may take the proposed name or ID, so a conflict causes
+the client to recheck the name and choose the next ID before retrying. Every
+writer must follow this protocol for the indexes to remain unique.
+
+The initial value must represent the empty log. `State` owns and mutates it;
+`Value` returns a shallow copy, with maps and pointers still referring to the
+same data. State is not safe for concurrent use. Share it only with caller
+synchronization covering catch-up, decisions, and reads of referenced data.
+
+The applied revision advances only after every item in a batch succeeds. Any
+apply error permanently poisons the State. `Err()`, `Sync`, and `SyncTo` return
+the same sticky error, wrapping the callback error with its revision and item
+number. Further syncs perform no I/O or callback calls. The application value
+may contain a partially applied batch, including mutations from the failing
+call, and must not be used. After addressing the cause, rebuild with `LoadState`
+and a fresh initial value. There is no rollback or reset of a poisoned State.
+
+Store and scan errors remain resumable: `LoadState` returns the partial State
+alongside the error, and if `state.Err()` is nil, `Sync` can retry without
+reapplying successful batches. Cancellation outside apply takes effect between
+batches; a context error returned by apply itself poisons the State. A snapshot
+is a fixed upper bound: writes arriving during sync are left for the next call.
+
+The lower-level [following example](example_follow_test.go) tracks the index and
+applied revision directly using `LoadHead`, `Scan`, and `After`. State uses the
+same scan ranges and I/O behavior. Packed segments can contain older batches,
+but only values from previously unapplied batches reach the apply callback.
 
 Without transport retries or an application-provided cache, the costs are:
 
@@ -110,14 +152,14 @@ A partially overlapping segment is fetched and validated in full, including any
 older entries it contains; only the new entries are applied. The core does not
 cache objects between calls.
 
-`Log` and `Store` have no watch API. Run the example's `catchUp` closure from one
+`Log` and `Store` have no watch API. Call `state.Sync` from one
 goroutine using a ticker, an application-provided wakeup channel, or both:
 
 ```go
 ticker := time.NewTicker(time.Second)
 defer ticker.Stop()
 for {
-    if err := catchUp(); err != nil { return err }
+    if _, err := state.Sync(ctx); err != nil { return err }
     select {
     case <-ctx.Done():
         return ctx.Err()
@@ -130,10 +172,11 @@ for {
 
 Treat external notifications, such as S3 notifications for committed log keys,
 as hints to catch up. Duplicate or coalesced hints work; a periodic poll covers
-missed hints. If other goroutines read the index, hold a mutex across the entire
-batch and its checkpoint update. If applying a batch can fail, stage its updates
-and publish them together only on success, or make replay safe. When persisting
-the index, commit the whole batch's updates and last-applied revision in the same
+missed hints. If other goroutines read the State, hold a mutex across sync and
+index access, and check `Err()` before using the value. For applications managing
+their own index with `Scan`, callbacks receive whole batches; stage each batch's
+updates or provide rollback if apply failures need to be retried. When persisting
+that index, commit the whole batch's updates and last-applied revision in the same
 transaction. Log atomicity does not make application index updates atomic.
 
 For mostly idle logs, probing `LoadRevision(applied+1)` uses one GET and no LIST:

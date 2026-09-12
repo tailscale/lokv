@@ -211,10 +211,10 @@ func (lg *Log[T]) get(ctx context.Context, key string, referenced bool) ([]byte,
 // for a nonempty namespace. An empty namespace returns nil without a Get.
 // A malformed first key is never skipped.
 //
-// To build an in-memory index, scan the returned snapshot with [All]. On later
-// polls, use [After] with the last successfully applied revision to scan through
-// the new snapshot's revision. Skip the scan if no revisions were added. See the
-// follow example for [Log.Scan].
+// [LoadState] builds an in-memory index and [State.Sync] keeps it current.
+// To manage the applied revision directly, scan the returned snapshot with [All].
+// On later polls, use [After] with the last successfully applied revision to scan
+// through the new snapshot's revision. See the follow example for [Log.Scan].
 //
 // Every nonempty LoadHead call fetches the root, even if it has not changed.
 // Log does not provide notifications; callers arrange polling or wakeups. A
@@ -252,7 +252,8 @@ func (lg *Log[T]) LoadHead(ctx context.Context) (*Snapshot[T], error) {
 // Get. ErrNotFound means no successor was visible at that lookup. Check for
 // [MaxRevision] before incrementing. If a successor exists, LoadHead can discover
 // the latest root for a batch catch-up, at the cost of an extra probe Get on
-// active polls. See the follow example for [Log.Scan].
+// active polls. A loaded snapshot can be applied with [State.SyncTo]. See the
+// follow example for [Log.Scan] for managing the applied revision directly.
 func (lg *Log[T]) LoadRevision(ctx context.Context, revision int64) (*Snapshot[T], error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -349,7 +350,9 @@ func (lg *Log[T]) Append(ctx context.Context, value ...T) (Record[T], error) {
 // then append its reservation against that same snapshot. On ErrConflict, catch
 // up and check again: another writer may have reserved the name. [Log.Append]
 // automatically retries the same value, so it cannot recheck that decision.
-// See the follow example for [Log.Scan] for maintaining such an index.
+// [State.Sync] maintains such an index and returns a snapshot suitable as the
+// base. The State example demonstrates unique username registration and user ID
+// allocation, including recomputing both decisions after a conflict.
 //
 // AppendTo returns the new snapshot on success. A sequential writer can reuse
 // it as the next base. Reusing a loaded or returned snapshot avoids the List and
