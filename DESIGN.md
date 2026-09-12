@@ -410,11 +410,17 @@ type Log[T any] struct { /* private */ }
 
 func Open[T any](cfg Config) (*Log[T], error)
 
+// CommitID identifies an append invocation and is reused on retries.
+type CommitID [16]byte
+
+// RecordHash is a record's logical SHA-256 hash, linking it to its history.
+type RecordHash [32]byte
+
 type Record[T any] struct {
     Revision   uint64
-    CommitID   [16]byte
+    CommitID   CommitID
     Value      T
-    RecordHash [32]byte
+    RecordHash RecordHash
 }
 
 // Head returns (zero, false, nil) for an empty log.

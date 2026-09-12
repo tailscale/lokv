@@ -80,12 +80,20 @@ func Open[T any](cfg Config) (*Log[T], error) {
 	return &Log[T]{cfg.Store, p, cfg.MaxConflictRetries, cfg.MaxEventBytes, cfg.MaxObjectBytes}, nil
 }
 
+// CommitID identifies an append invocation. It contains 16 cryptographically
+// random bytes generated once per Append or AppendTo call and reused on retries.
+type CommitID [16]byte
+
+// RecordHash is a record's logical SHA-256 hash. It covers the record's revision,
+// commit ID, predecessor's hash, and JSON-encoded event, linking it to its history.
+type RecordHash [32]byte
+
 // Record is a decoded log event and its identity.
 type Record[T any] struct {
 	Revision   uint64
-	CommitID   [16]byte
+	CommitID   CommitID
 	Value      T
-	RecordHash [32]byte
+	RecordHash RecordHash
 }
 
 // Preserve errors.Is/As without exposing a custom codec's payload-bearing text.
@@ -236,7 +244,7 @@ func (l *Log[T]) prepare(value T) (json.RawMessage, string, error) {
 	if int64(len(b)) > l.maxEvent {
 		return nil, "", ErrTooLarge
 	}
-	var id [16]byte
+	var id CommitID
 	if _, err := rand.Read(id[:]); err != nil {
 		return nil, "", fmt.Errorf("lokv: generate commit ID: %w", err)
 	}
