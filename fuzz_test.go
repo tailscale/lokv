@@ -54,8 +54,8 @@ func FuzzFrontier(f *testing.F) {
 	})
 }
 
-func FuzzIndexDecoding(f *testing.F) {
-	f.Add([]byte(`{"format":"lokv/index/v1","level":2,"start":"0000000000000001","end":"0000000000000100","children":[]}`))
+func FuzzSegmentDecoding(f *testing.F) {
+	f.Add([]byte(`{"format":"lokv/segment/v3","level":2,"start":"0000000000000001","end":"0000000000000100","records":[]}`))
 	lg := testLog[int](f, newStore())
 	f.Fuzz(func(t *testing.T, b []byte) {
 		if len(b) > 1<<20 {
@@ -63,7 +63,7 @@ func FuzzIndexDecoding(f *testing.F) {
 		}
 		ref := objectRef{2, hexRevision(1), hexRevision(256), "", digest(b), zeroHash, zeroHash}
 		ref.Key = lg.treeKey(ref)
-		_, _ = lg.decodeIndex(ref, b)
+		_, _ = lg.decodeSegment(ref, compressTest(t, b))
 	})
 }
 
@@ -71,17 +71,17 @@ func FuzzSegmentDecompression(f *testing.F) {
 	f.Add(compressTest(f, []byte(`{}`)))
 	f.Add([]byte(""))
 	f.Add([]byte("not zstd"))
-	lg, err := Open[int](Config{Store: newStore(), MaxEventBytes: 1 << 16, MaxObjectBytes: 1 << 20})
-	if err != nil {
-		f.Fatal(err)
-	}
+	lg := testLog[int](f, newStore())
 	f.Fuzz(func(t *testing.T, b []byte) {
 		if len(b) > 1<<20 {
 			return
 		}
-		raw, err := lg.decompress(b)
-		if err == nil && len(raw) > 1<<20 {
-			t.Fatal("limit exceeded")
+		// Bound this fuzz workload, not production decoding. Unknown-size frames
+		// have deterministic coverage in TestDecompression.
+		h, err := singleFrame(b)
+		if err == nil && (!h.HasFCS || h.FrameContentSize > 1<<20) {
+			return
 		}
+		_, _ = lg.decompress(b)
 	})
 }

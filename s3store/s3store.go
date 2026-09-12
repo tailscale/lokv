@@ -34,21 +34,18 @@ type Client interface {
 }
 
 // Config contains backend settings; AWS credentials, region, and general
-// transport retry policy are configured on Client. MaxObjectBytes should match
-// or exceed lokv.Config.MaxObjectBytes.
+// transport retry policy are configured on Client.
 type Config struct {
 	Client             Client
 	Bucket             string
-	MaxObjectBytes     int64 // Default 64 MiB, maximum 256 MiB.
-	MaxConflictRetries int   // Retries HTTP 409 conditional conflicts; default 8.
+	MaxConflictRetries int // Retries HTTP 409 conditional conflicts; default 8.
 }
 
 // Store implements lokv.Store without update, delete, or multipart methods.
 type Store struct {
-	client    Client
-	bucket    string
-	maxObject int64
-	retries   int
+	client  Client
+	bucket  string
+	retries int
 }
 
 var _ lokv.Store = (*Store)(nil)
@@ -83,16 +80,13 @@ func New(cfg Config) (*Store, error) {
 			return nil, errors.New("s3store: invalid bucket name")
 		}
 	}
-	if cfg.MaxObjectBytes < 0 || cfg.MaxObjectBytes > 256<<20 || cfg.MaxConflictRetries < 0 {
+	if cfg.MaxConflictRetries < 0 {
 		return nil, errors.New("s3store: invalid limit")
-	}
-	if cfg.MaxObjectBytes == 0 {
-		cfg.MaxObjectBytes = 64 << 20
 	}
 	if cfg.MaxConflictRetries == 0 {
 		cfg.MaxConflictRetries = 8
 	}
-	return &Store{cfg.Client, b, cfg.MaxObjectBytes, cfg.MaxConflictRetries}, nil
+	return &Store{cfg.Client, b, cfg.MaxConflictRetries}, nil
 }
 
 func (s *Store) wrap(op, key string, err error) error {
@@ -152,7 +146,7 @@ func (s *Store) List(ctx context.Context, prefix string, limit int) ([]string, e
 	return keys, nil
 }
 
-// Get reads and closes a bounded response body, without trusting ContentLength.
+// Get reads and closes the complete response body without imposing a size limit.
 func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -168,13 +162,7 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 		return nil, s.wrap("get", key, lokv.ErrCorrupt)
 	}
 	defer out.Body.Close()
-	if out.ContentLength != nil && *out.ContentLength > s.maxObject {
-		return nil, s.wrap("get", key, lokv.ErrTooLarge)
-	}
-	b, err := io.ReadAll(io.LimitReader(out.Body, s.maxObject+1))
-	if int64(len(b)) > s.maxObject {
-		return nil, s.wrap("get", key, lokv.ErrTooLarge)
-	}
+	b, err := io.ReadAll(out.Body)
 	if err != nil {
 		return nil, s.wrap("get", key, err)
 	}
@@ -188,9 +176,6 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 // with bounded jitter; HTTP 412 maps to ErrExists. Other transport retries are
 // handled by the configured AWS SDK retryer.
 func (s *Store) Create(ctx context.Context, key string, value []byte) error {
-	if int64(len(value)) > s.maxObject {
-		return s.wrap("put", key, lokv.ErrTooLarge)
-	}
 	contentType := "application/json"
 	if strings.HasSuffix(key, ".zst") {
 		contentType = "application/zstd"

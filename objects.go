@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"sync/atomic"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -33,11 +32,7 @@ func (lg *Log[T]) carry(ctx context.Context, base *Snapshot[T]) ([]frontierLevel
 			break
 		}
 		var err error
-		if level == 0 {
-			carry, err = lg.createSegment(ctx, levels[0], base)
-		} else {
-			carry, err = lg.createIndex(ctx, uint8(level+1), levels[level])
-		}
+		carry, err = lg.createSegment(ctx, levels[level], base)
 		if err != nil {
 			return nil, err
 		}
@@ -54,41 +49,6 @@ func (lg *Log[T]) carry(ctx context.Context, base *Snapshot[T]) ([]frontierLevel
 
 func aggregateRef(level uint8, children []objectRef) objectRef {
 	return objectRef{Level: level, Start: children[0].Start, End: children[len(children)-1].End, FirstPrevHash: children[0].FirstPrevHash, LastRecordHash: children[len(children)-1].LastRecordHash}
-}
-
-func (lg *Log[T]) validateChildren(ref objectRef, children []objectRef) error {
-	start, end, err := lg.validateRef(ref)
-	if err != nil {
-		return err
-	}
-	if ref.Level < 2 || len(children) != 16 {
-		return corrupt("invalid index child count or level")
-	}
-	next, chain := start, ref.FirstPrevHash
-	for i, child := range children {
-		cs, ce, err := lg.validateRef(child)
-		if err != nil {
-			return err
-		}
-		if child.Level != ref.Level-1 || cs != next || ce > end || child.FirstPrevHash != chain {
-			return corrupt("index adjacency mismatch")
-		}
-		chain = child.LastRecordHash
-		if i == 15 {
-			if ce != end {
-				return corrupt("index end mismatch")
-			}
-		} else {
-			if ce == end {
-				return corrupt("index ends before its last child")
-			}
-			next = ce + 1
-		}
-	}
-	if chain != ref.LastRecordHash {
-		return corrupt("index hash boundary mismatch")
-	}
-	return nil
 }
 
 func (lg *Log[T]) loadCommitRef(ctx context.Context, ref objectRef, cached *Snapshot[T]) (*commit, error) {
@@ -122,9 +82,33 @@ func (lg *Log[T]) loadCommitRef(ctx context.Context, ref objectRef, cached *Snap
 	return c, nil
 }
 
+// loadRecords reads a complete referenced range without consulting its older
+// constituent objects. Level 0 is a commit; every higher level is a packed segment.
+func (lg *Log[T]) loadRecords(ctx context.Context, ref objectRef, base *Snapshot[T]) ([]projection, error) {
+	if ref.Level == 0 {
+		c, err := lg.loadCommitRef(ctx, ref, base)
+		if err != nil {
+			return nil, err
+		}
+		return []projection{c.project()}, nil
+	}
+	if _, _, err := lg.validateRef(ref); err != nil {
+		return nil, err
+	}
+	body, err := lg.get(ctx, ref.Key, true)
+	if err != nil {
+		return nil, err
+	}
+	seg, err := lg.decodeSegment(ref, body)
+	if err != nil {
+		return nil, err
+	}
+	return seg.Records, nil
+}
+
 func (lg *Log[T]) createSegment(ctx context.Context, children []objectRef, base *Snapshot[T]) (objectRef, error) {
-	ref := aggregateRef(1, children)
-	records := make([]projection, 16)
+	ref := aggregateRef(children[0].Level+1, children)
+	var parts [16][]projection
 	workCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	// At most four GETs are in flight. Each worker owns distinct output slots;
@@ -132,23 +116,18 @@ func (lg *Log[T]) createSegment(ctx context.Context, children []objectRef, base 
 	var wg sync.WaitGroup
 	var firstErr error
 	var once sync.Once
-	var eventBytes atomic.Int64
 	for worker := 0; worker < 4; worker++ {
 		wg.Go(func() {
 			for i := worker; i < 16; i += 4 {
 				if workCtx.Err() != nil {
 					return
 				}
-				c, err := lg.loadCommitRef(workCtx, children[i], base)
+				records, err := lg.loadRecords(workCtx, children[i], base)
 				if err != nil {
 					once.Do(func() { firstErr = err; cancel() })
 					return
 				}
-				if eventBytes.Add(int64(len(c.Event))) > lg.maxObject {
-					once.Do(func() { firstErr = ErrTooLarge; cancel() })
-					return
-				}
-				records[i] = c.project()
+				parts[i] = records
 			}
 		})
 	}
@@ -159,13 +138,14 @@ func (lg *Log[T]) createSegment(ctx context.Context, children []objectRef, base 
 	if err := ctx.Err(); err != nil {
 		return objectRef{}, err
 	}
-	seg := segment{segmentFormat, 1, ref.Start, ref.End, records}
+	var records []projection
+	for _, part := range parts {
+		records = append(records, part...)
+	}
+	seg := segment{segmentFormat, ref.Level, ref.Start, ref.End, records}
 	raw, err := json.Marshal(seg)
 	if err != nil {
 		return objectRef{}, errors.New("lokv: encode segment")
-	}
-	if int64(len(raw)) > lg.maxObject {
-		return objectRef{}, ErrTooLarge
 	}
 	ref.SHA256 = digest(raw)
 	ref.Key = lg.treeKey(ref)
@@ -184,28 +164,7 @@ func (lg *Log[T]) createSegment(ctx context.Context, children []objectRef, base 
 	return ref, nil
 }
 
-func (lg *Log[T]) createIndex(ctx context.Context, level uint8, children []objectRef) (objectRef, error) {
-	ref := aggregateRef(level, children)
-	node := indexNode{indexFormat, level, ref.Start, ref.End, children}
-	body, err := json.Marshal(node)
-	if err != nil {
-		return objectRef{}, errors.New("lokv: encode index")
-	}
-	ref.SHA256 = digest(body)
-	ref.Key = lg.treeKey(ref)
-	if err := lg.validateChildren(ref, children); err != nil {
-		return objectRef{}, err
-	}
-	if err := lg.createAggregate(ctx, ref, body); err != nil {
-		return objectRef{}, err
-	}
-	return ref, nil
-}
-
 func (lg *Log[T]) createAggregate(ctx context.Context, ref objectRef, body []byte) error {
-	if int64(len(body)) > lg.maxObject {
-		return ErrTooLarge
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -220,11 +179,7 @@ func (lg *Log[T]) createAggregate(ctx context.Context, ref objectRef, body []byt
 		}
 		return err
 	}
-	if ref.Level == 1 {
-		_, err = lg.decodeSegment(ref, actual)
-	} else {
-		_, err = lg.decodeIndex(ref, actual)
-	}
+	_, err = lg.decodeSegment(ref, actual)
 	return err
 }
 
@@ -267,25 +222,17 @@ func singleFrame(b []byte) (zstd.Header, error) {
 }
 
 func (lg *Log[T]) decompress(body []byte) ([]byte, error) {
-	if int64(len(body)) > lg.maxObject {
-		return nil, fmt.Errorf("%w: %w", ErrCorrupt, ErrTooLarge)
-	}
-	h, err := singleFrame(body)
-	if err != nil {
+	if _, err := singleFrame(body); err != nil {
 		return nil, err
 	}
-	if h.HasFCS && h.FrameContentSize > uint64(lg.maxObject) {
-		return nil, fmt.Errorf("%w: %w", ErrCorrupt, ErrTooLarge)
-	}
-	dec, err := zstd.NewReader(bytes.NewReader(body), zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(uint64(max(lg.maxObject, 1<<20))), zstd.WithDecoderMaxWindow(1<<20))
+	// Bound compression history, not output size. Upper levels may contain
+	// arbitrarily large ranges. The reader API avoids DecodeAll's output cap.
+	dec, err := zstd.NewReader(bytes.NewReader(body), zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(1<<20), zstd.WithDecodeBuffersBelow(0))
 	if err != nil {
 		return nil, corrupt("invalid zstd stream")
 	}
 	defer dec.Close()
-	raw, err := io.ReadAll(io.LimitReader(dec, lg.maxObject+1))
-	if int64(len(raw)) > lg.maxObject || errors.Is(err, zstd.ErrDecoderSizeExceeded) || errors.Is(err, zstd.ErrWindowSizeExceeded) {
-		return nil, fmt.Errorf("%w: %w", ErrCorrupt, ErrTooLarge)
-	}
+	raw, err := io.ReadAll(dec)
 	if err != nil {
 		return nil, corrupt("invalid zstd data")
 	}
@@ -293,11 +240,11 @@ func (lg *Log[T]) decompress(body []byte) ([]byte, error) {
 }
 
 func (lg *Log[T]) validateSegment(ref objectRef, seg *segment) error {
-	start, _, err := lg.validateRef(ref)
+	start, end, err := lg.validateRef(ref)
 	if err != nil {
 		return err
 	}
-	if ref.Level != 1 || seg.Format != segmentFormat || seg.Level != 1 || seg.Start != ref.Start || seg.End != ref.End || len(seg.Records) != 16 {
+	if ref.Level == 0 || seg.Format != segmentFormat || seg.Level != ref.Level || seg.Start != ref.Start || seg.End != ref.End || int64(len(seg.Records)) != end-start+1 {
 		return corrupt("segment envelope mismatch")
 	}
 	chain := ref.FirstPrevHash
@@ -333,24 +280,4 @@ func (lg *Log[T]) decodeSegment(ref objectRef, body []byte) (*segment, error) {
 		return nil, err
 	}
 	return &seg, nil
-}
-
-func (lg *Log[T]) decodeIndex(ref objectRef, body []byte) (*indexNode, error) {
-	if int64(len(body)) > lg.maxObject {
-		return nil, fmt.Errorf("%w: %w", ErrCorrupt, ErrTooLarge)
-	}
-	if digest(body) != ref.SHA256 {
-		return nil, corrupt("index digest mismatch")
-	}
-	var node indexNode
-	if err := decodeJSON(body, &node); err != nil {
-		return nil, err
-	}
-	if node.Format != indexFormat || node.Level != ref.Level || node.Start != ref.Start || node.End != ref.End {
-		return nil, corrupt("index envelope mismatch")
-	}
-	if err := lg.validateChildren(ref, node.Children); err != nil {
-		return nil, err
-	}
-	return &node, nil
 }

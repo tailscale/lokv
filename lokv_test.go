@@ -186,6 +186,7 @@ func TestBoundariesAndCounts(t *testing.T) {
 				t.Fatal(head)
 			}
 			var got []int
+			beforeGets = s.gets
 			err = lg.Scan(context.Background(), snap, Range{1, int64(n)}, func(r Record[int]) error {
 				if r.Revision != int64(len(got)+1) {
 					t.Fatal("unordered scan")
@@ -195,6 +196,13 @@ func TestBoundariesAndCounts(t *testing.T) {
 			})
 			if err != nil || len(got) != n {
 				t.Fatalf("scan count %d: %v", len(got), err)
+			}
+			wantGets := 0
+			for remaining := n - 1; remaining > 0; remaining /= 16 {
+				wantGets += remaining % 16
+			}
+			if s.gets-beforeGets != wantGets {
+				t.Fatalf("full scan GETs = %d, want %d", s.gets-beforeGets, wantGets)
 			}
 			for i, v := range got {
 				if i != v {
@@ -485,7 +493,7 @@ func TestRangesAndPruning(t *testing.T) {
 		if (count == 0 || r.First == 513) && len(s.getKeys) != 0 {
 			t.Fatal("empty or head-only scan fetched objects")
 		}
-		if r.First == 257 && r.Last == 272 && len(s.getKeys) != 2 {
+		if r.First == 257 && r.Last == 272 && len(s.getKeys) != 1 {
 			t.Fatalf("GETs: %v", s.getKeys)
 		}
 	}
@@ -497,7 +505,7 @@ func TestRangesAndPruning(t *testing.T) {
 	stop := errors.New("stop")
 	s.getKeys = nil
 	calls := 0
-	if err := lg.Scan(context.Background(), snap, Range{1, 513}, func(Record[int]) error { calls++; return stop }); !errors.Is(err, stop) || calls != 1 || len(s.getKeys) != 2 {
+	if err := lg.Scan(context.Background(), snap, Range{1, 513}, func(Record[int]) error { calls++; return stop }); !errors.Is(err, stop) || calls != 1 || len(s.getKeys) != 1 {
 		t.Fatalf("early stop: %d %d %v", calls, len(s.getKeys), err)
 	}
 }
@@ -541,7 +549,7 @@ func TestRangeHelpersEmptyAndInvalid(t *testing.T) {
 
 func TestConfiguration(t *testing.T) {
 	var typedNil *testStore
-	for _, cfg := range []Config{{}, {Store: typedNil}, {Store: newStore(), MaxConflictRetries: -1}, {Store: newStore(), MaxEventBytes: -1}, {Store: newStore(), MaxObjectBytes: -1}, {Store: newStore(), MaxEventBytes: 20, MaxObjectBytes: 10}, {Store: newStore(), MaxObjectBytes: 257 << 20}, {Store: newStore(), Prefix: "a/../b"}, {Store: newStore(), Prefix: "a//b"}, {Store: newStore(), Prefix: "x\x00y"}, {Store: newStore(), Prefix: "x\\y"}, {Store: newStore(), Prefix: string([]byte{255})}} {
+	for _, cfg := range []Config{{}, {Store: typedNil}, {Store: newStore(), MaxConflictRetries: -1}, {Store: newStore(), MaxEventBytes: -1}, {Store: newStore(), Prefix: "a/../b"}, {Store: newStore(), Prefix: "a//b"}, {Store: newStore(), Prefix: "x\x00y"}, {Store: newStore(), Prefix: "x\\y"}, {Store: newStore(), Prefix: string([]byte{255})}} {
 		if _, err := Open[int](cfg); err == nil {
 			t.Fatalf("accepted %+v", cfg)
 		}
@@ -571,7 +579,7 @@ func TestConfiguration(t *testing.T) {
 
 func TestLimits(t *testing.T) {
 	s := newStore()
-	lg, err := Open[string](Config{Store: s, MaxEventBytes: 8, MaxObjectBytes: 1000})
+	lg, err := Open[string](Config{Store: s, MaxEventBytes: 8})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -581,19 +589,8 @@ func TestLimits(t *testing.T) {
 	if s.creates+s.gets+s.lists != 0 {
 		t.Fatal("oversize event performed I/O")
 	}
-	tiny, err := Open[int](Config{Store: s, MaxEventBytes: 4, MaxObjectBytes: 4})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tiny.Append(context.Background(), 0); !errors.Is(err, ErrTooLarge) {
-		t.Fatal(err)
-	}
-	if s.creates != 0 {
-		t.Fatal("oversize commit was uploaded")
-	}
-	s.objects[lg.logKey(1)] = bytes.Repeat([]byte("x"), 1001)
-	if _, err := lg.LoadHead(context.Background()); !errors.Is(err, ErrTooLarge) || !errors.Is(err, ErrCorrupt) {
-		t.Fatal(err)
+	if _, err := lg.Append(context.Background(), "1234"); err != nil {
+		t.Fatal(err) // The complete batch fits; metadata must not cause rejection.
 	}
 }
 

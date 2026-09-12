@@ -17,9 +17,8 @@ import (
 )
 
 const (
-	commitFormat  = "lokv/commit/v2"
-	segmentFormat = "lokv/segment/v2"
-	indexFormat   = "lokv/index/v1"
+	commitFormat  = "lokv/commit/v3"
+	segmentFormat = "lokv/segment/v3"
 	zeroHash      = "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
@@ -62,13 +61,6 @@ type segment struct {
 	Start   string       `json:"start"`
 	End     string       `json:"end"`
 	Records []projection `json:"records"`
-}
-type indexNode struct {
-	Format   string      `json:"format"`
-	Level    uint8       `json:"level"`
-	Start    string      `json:"start"`
-	End      string      `json:"end"`
-	Children []objectRef `json:"children"`
 }
 
 func hexRevision(r int64) string { return fmt.Sprintf("%016x", r) }
@@ -137,11 +129,7 @@ func (lg *Log[T]) parseLogKey(key string) (int64, error) {
 }
 
 func (lg *Log[T]) treeKey(ref objectRef) string {
-	suffix := ".json"
-	if ref.Level == 1 {
-		suffix += ".zst"
-	}
-	return fmt.Sprintf("%sv1/tree/%x/%s-%s-%s%s", lg.prefix, ref.Level, ref.Start, ref.End, ref.SHA256, suffix)
+	return fmt.Sprintf("%sv1/tree/%x/%s-%s-%s.json.zst", lg.prefix, ref.Level, ref.Start, ref.End, ref.SHA256)
 }
 
 func recordHash(r int64, id, prev string, event []byte) string {
@@ -272,9 +260,6 @@ func (lg *Log[T]) validateProjection(p projection) (int64, error) {
 	if r == 1 && p.PreviousRecordHash != zeroHash {
 		return 0, corrupt("invalid genesis hash")
 	}
-	if int64(len(p.Event)) > lg.maxEvent {
-		return 0, fmt.Errorf("%w: %w: event", ErrCorrupt, ErrTooLarge)
-	}
 	if len(p.Event) < 3 || p.Event[0] != '[' || p.Event[len(p.Event)-1] != ']' {
 		return 0, corrupt("event must be a nonempty batch array")
 	}
@@ -358,9 +343,6 @@ func (lg *Log[T]) validateFrontier(frontier []frontierLevel, revision int64, pre
 }
 
 func (lg *Log[T]) decodeCommit(key string, body []byte) (*commit, error) {
-	if int64(len(body)) > lg.maxObject {
-		return nil, fmt.Errorf("%w: %w", ErrCorrupt, ErrTooLarge)
-	}
 	r, err := lg.parseLogKey(key)
 	if err != nil {
 		return nil, err

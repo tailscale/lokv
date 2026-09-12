@@ -27,7 +27,7 @@ type Store interface {
 	List(ctx context.Context, prefix string, limit int) ([]string, error)
 
 	// Get returns the complete object, or an error matching ErrNotFound.
-	// Adapters must bound response bodies before allocating them in memory.
+	// Packed objects grow with their covered history and have no size limit.
 	Get(ctx context.Context, key string) ([]byte, error)
 
 	// Create atomically publishes a complete value only if key is absent.
@@ -42,7 +42,7 @@ var (
 	ErrConflict   = errors.New("lokv: append conflict")
 	ErrCorrupt    = errors.New("lokv: corrupt log")
 	ErrRange      = errors.New("lokv: invalid range")
-	ErrTooLarge   = errors.New("lokv: object too large")
+	ErrTooLarge   = errors.New("lokv: append batch too large")
 	ErrExhausted  = errors.New("lokv: revision space exhausted")
 	ErrEmptyBatch = errors.New("lokv: empty batch")
 )

@@ -8,7 +8,7 @@ SPDX-License-Identifier: BSD-3-Clause
 Status: implementation specification\
 Target language: Go\
 Working package name: `lokv`\
-Key layout: `lokv/v1`; commit and segment envelopes: v2; index envelopes: v1
+Key layout: `lokv/v1`; commit and segment envelopes: v3
 
 ## 1. Summary
 
@@ -33,9 +33,8 @@ Ascending lexical order therefore returns the highest revision first.
 History preceding each head is represented by an immutable radix-16 frontier:
 
 - level 0 references an individual commit/event object and covers 1 record;
-- level 1 is a packed zstd segment containing 16 records;
-- level `L >= 2` is a small index node containing 16 level `L-1` references and
-  covers `16^L` records;
+- every level `L >= 1` is a packed zstd segment containing all `16^L` records
+  in its range (16, 256, 4096, 65536, and so on);
 - a head has 0–15 references at each level. The reference count at level `L`
   equals hexadecimal digit `L` of the number of preceding records.
 
@@ -58,7 +57,8 @@ overwritten or deleted by this library.
 2. Give committed records a gap-free `int64` revision starting at 1.
 3. Find the latest committed revision with one `LIST` returning at most one key.
 4. Use one object creation for an append that causes no radix carry.
-5. Avoid repeatedly rewriting all historical event bytes.
+5. Download complete history with one GET per frontier object, using larger
+   packed ranges at successive levels.
 6. Support safe optimistic concurrent writers using conditional creation of the
    deterministic next-revision key.
 7. Make every historical revision a readable snapshot/root of the log as it
@@ -107,8 +107,8 @@ overwritten or deleted by this library.
 : A canonical partition of revisions `[1, head.revision)` into ordered blocks.
 
 `reference`
-: A key, content digest, level, and inclusive revision range naming a commit,
-  segment, or index node.
+: A key, content digest, level, and inclusive revision range naming a commit
+  or a packed segment.
 
 Required invariants:
 
@@ -196,7 +196,7 @@ that tradeoff explicit.
 The first adapter should target a general-purpose Amazon S3 bucket:
 
 - `List` uses `ListObjectsV2` and requests `MaxKeys=limit`;
-- `Get` uses `GetObject` with a bounded reader;
+- `Get` uses `GetObject` and reads the complete response body;
 - `Create` uses `PutObject` with `If-None-Match: *` and maps HTTP 412 to
   `ErrExists`; HTTP 409 is retried as directed by S3;
 - S3 creation is atomic and subsequent GET/LIST operations are strongly
@@ -218,8 +218,7 @@ prefix is allowed. All package-owned objects live under `<prefix>/v1/`.
 
 ```text
 <prefix>/v1/log/<reverse-revision-16hex>.json
-<prefix>/v1/tree/1/<start-16hex>-<end-16hex>-<sha256hex>.json.zst
-<prefix>/v1/tree/<level-hex>/<start-16hex>-<end-16hex>-<sha256hex>.json
+<prefix>/v1/tree/<level-hex>/<start-16hex>-<end-16hex>-<sha256hex>.json.zst
 ```
 
 Rules:
@@ -228,8 +227,8 @@ Rules:
   lowercase hexadecimal digits.
 - `start` and `end` are inclusive revisions, also exactly 16 lowercase hex
   digits.
-- Level 1 is a compressed data segment. Levels 2 through `f` are uncompressed
-  index nodes.
+- Every nonzero level is a compressed data segment containing its full range.
+  Revision bounds currently permit levels through hexadecimal `d` (13).
 - Put no other object directly under `v1/log/`; otherwise it could shadow HEAD.
 - A record key is deterministic per revision. A tree key is content-addressed.
 - Stored values are opaque bytes; correctness must not depend on backend object
@@ -266,7 +265,7 @@ characters.
 
 ```json
 {
-  "format": "lokv/commit/v2",
+  "format": "lokv/commit/v3",
   "revision": "0000000000000011",
   "commit_id": "66b7d24d9d8c4f519b8c126e486fa953",
   "previous": {
@@ -310,9 +309,10 @@ array instead of `encoding/json`'s special base64 encoding of `[]byte`.
 Marshal the whole batch before any S3 operation and reuse its bytes for all
 retries. `MaxEventBytes` limits the complete array, including punctuation.
 
-Commit and segment format markers are v2. Reject old v1 envelopes, including
-old array-valued events that could otherwise be mistaken for multiple items.
-The v1 key layout, index format, and record hash algorithm remain unchanged.
+Commit and segment format markers are v3. Reject earlier envelopes: v1 did
+not have batch semantics, and v2 commits could reference index-only upper
+levels. Commit keys and the record hash algorithm remain unchanged. All
+aggregate keys now end in `.json.zst`.
 
 ### 7.2 Logical record hash
 
@@ -355,13 +355,14 @@ of its exact stored bytes. For a tree reference, `SHA256` is the SHA-256 of the
 canonical, uncompressed aggregate JSON. Range and boundary hashes allow readers
 to validate adjacency without opening unrelated siblings.
 
-### 7.4 Level-1 packed segment
+### 7.4 Packed segment at every nonzero level
 
-A level-1 segment contains exactly 16 record projections in revision order:
+A level-L segment contains exactly `16^L` record projections in revision order.
+For example, a level-1 segment contains 16:
 
 ```json
 {
-  "format": "lokv/segment/v2",
+  "format": "lokv/segment/v3",
   "level": 1,
   "start": "0000000000000001",
   "end": "0000000000000010",
@@ -380,32 +381,19 @@ A level-1 segment contains exactly 16 record projections in revision order:
 Marshal the canonical JSON, hash the uncompressed bytes, then compress with
 zstd. The object key uses the uncompressed digest. Readers decompress, hash the
 result, compare it with the key/reference, then decode. Use one fixed zstd
-configuration and impose both compressed and decompressed size limits to prevent
-resource exhaustion.
+configuration: default compression level, one encoder worker, a 1 MiB window,
+and checksums. The decoder bounds the window but imposes no output-size limit.
 
-Because original commit objects can never be deleted, packing duplicates each
-event's bytes once. It does not rewrite event payload at higher levels. This is
-intentional: historical scans need about one data GET per 16 records, while
-permanent event-data write amplification stays about 2x rather than growing
-with the number of levels.
+Each higher-level segment contains all records from 16 preceding segments.
+There are no child references inside it: a reader downloads one object for the
+whole range, without reading the original commits or lower-level segments.
+Every record retains its original event bytes, commit ID, and hash.
 
-### 7.5 Level-2 and higher index node
-
-```json
-{
-  "format": "lokv/index/v1",
-  "level": 2,
-  "start": "0000000000000001",
-  "end": "0000000000000100",
-  "children": [
-    {"level": 1, "start": "...", "end": "...", "key": "...", "sha256": "...",
-     "first_prev_hash": "...", "last_record_hash": "..."}
-  ]
-}
-```
-
-There are exactly 16 children, in revision order. Marshal canonical JSON and use
-the SHA-256 of the exact bytes in the key. Do not compress these small nodes.
+Compaction copies payloads at each completed level. Old objects remain stored
+for historical snapshots. This increases retained bytes and compaction work
+with the number of levels, while reducing full scans to the frontier objects.
+Object sizes are unbounded; the current API buffers objects and intermediate
+JSON in memory. Streaming is deferred to a later API change.
 
 ## 8. Public Go API
 
@@ -419,11 +407,10 @@ type Config struct {
 
     Store Store
 
-    // Defaults: 32 retries, 1 MiB batch JSON array, 64 MiB uncompressed segment,
-    // 256 MiB compressed-input/decompression safety ceiling as appropriate.
+    // Defaults: 32 retries, 1 MiB JSON array for new append batches.
+    // Reads and compaction of stored data have no byte limit.
     MaxConflictRetries int
     MaxEventBytes      int64
-    MaxObjectBytes     int64
 }
 
 type Log[T any] struct { /* private */ }
@@ -489,7 +476,7 @@ var (
     ErrConflict   = errors.New("lokv: append conflict")
     ErrCorrupt    = errors.New("lokv: corrupt log")
     ErrRange      = errors.New("lokv: invalid range")
-    ErrTooLarge   = errors.New("lokv: object too large")
+    ErrTooLarge   = errors.New("lokv: append batch too large")
     ErrExhausted  = errors.New("lokv: revision space exhausted")
     ErrEmptyBatch = errors.New("lokv: empty batch")
 )
@@ -510,7 +497,7 @@ None of these helpers waits for new records.
 advancing their checkpoint; if updates can fail or readers share the index, use
 an application transaction or lock to publish the whole batch consistently.
 
-`Open` rejects a nil store, malformed prefix, invalid size limits, and negative
+`Open` rejects a nil store, malformed prefix, negative batch limits, and negative
 retry counts before performing I/O. Backend-specific configuration such as S3
 bucket, region, credentials, and SDK client belongs to the adapter constructor,
 not `lokv.Config`.
@@ -549,11 +536,7 @@ for level = 0; ; level++ {
     children = frontier[level]       // exactly 16, chronological
     frontier[level] = empty
 
-    if level == 0 {
-        carry = createPackedSegment(children)
-    } else {
-        carry = createIndexNode(level+1, children)
-    }
+    carry = createPackedSegment(level+1, children)
 }
 
 validateCanonicalFrontier(frontier, R+1)
@@ -561,11 +544,12 @@ newCommit = commit(revision=R+1, previous=oldHead, frontier=frontier, event=batc
 store.Create(logKey(R+1), newCommit) // publish last
 ```
 
-Creating a packed segment requires the 16 raw commit bodies. The prior head body
-is already loaded; fetch any other needed level-0 children concurrently with a
-bounded worker group. Decode and validate each before packing only its record
-projection. A long-lived single writer may keep a small validated raw-tail cache,
-but correctness must not depend on it.
+Creating a packed segment requires all records from 16 children. At level 1,
+children are raw commits; the prior head body is already loaded and reused. At
+higher levels, children are packed segments. Fetch with at most four concurrent
+GETs, decode and validate each child, then concatenate its record projections
+in range order. Serialize and compress the complete combined range. Validate
+its record count, adjacency, and hash boundaries before publication.
 
 Aggregate writes are also conditional creates. If `Create` returns `ErrExists`, GET
 and validate it, then treat it as success. Concurrent writers based on the same
@@ -605,14 +589,15 @@ To read a snapshot in chronological order:
 1. Validate the commit envelope and key.
 2. Visit nonempty frontier levels from highest to lowest (at most 13 down to 0).
 3. Within each level, visit references in stored order.
-4. Recursively expand index nodes in child order.
-5. Decode level-1 segments and yield their records in order.
-6. GET/yield any level-0 commit references.
-7. Yield the snapshot commit's own record last.
+4. GET each nonzero-level segment and yield its complete records in order.
+   Do not fetch any lower-level objects for that segment.
+5. GET/yield any level-0 commit references.
+6. Yield the snapshot commit's own record last.
 
 For a range scan, compare the requested inclusive range with each reference's
-`start..end` and skip disjoint subtrees. A partially intersecting level-1
-segment is decompressed once and filtered by revision.
+`start..end` and skip disjoint ranges. A partially intersecting segment at any
+level is downloaded, decompressed, and validated in full, then filtered by
+revision. All frontier objects are fetched sequentially.
 
 Normal `Scan` validates every fetched object's content digest, format, level,
 range, internal adjacency, record hashes, and the hash-chain boundary between
@@ -653,16 +638,19 @@ a common-case PUT and still would not provide a multi-key transaction.
 For `N` appended batch records (regardless of the number of items per batch):
 
 - commit creations: `N`;
-- level-1 segment creations: approximately `N/16`;
-- level-2 node creations: approximately `N/256`;
-- higher levels: `N/4096`, and so on;
+- level-L segment creations: `floor((N-1)/16^L)`;
 - total object creations approach `16N/15`;
-- original event JSON is stored once in its commit and once in a level-1 packed
-  segment after the containing group closes;
-- higher levels copy references only, not event bytes;
+- original event JSON is stored in its commit and copied into a segment at
+  each completed level; retained payload and compaction work grow with levels;
 - one current head/frontier is discoverable with one LIST plus one GET;
-- a full old-history data scan uses approximately `N/16` segment GETs plus a
-  much smaller number of index-node GETs and up to 16 raw/head GETs.
+- a full scan fetches each frontier object exactly once, plus the head;
+- for `N > 0`, the total GET count is `1 + sum(hex digits of N-1)`;
+- at `N = 65537`, one level-4 segment plus the head needs two GETs;
+- at `N = 1000000`, the frontier has 15 level-4, 4 level-3, 2 level-2,
+  3 level-1, and 15 level-0 references: 40 GETs including the head.
+
+These counts exclude retries. Empty-log discovery needs only one LIST.
+Scans never fetch the constituent lower-level objects of a packed segment.
 
 The permanent metadata cost of copying a bounded frontier into each commit is
 linear in `N`, not quadratic. Actual byte cost should be benchmarked because a
@@ -716,8 +704,9 @@ account):
 }
 ```
 
-Keep objects below the single-`PutObject` limit and do not use multipart upload
-in v1. This keeps conditional-create behavior and failure handling simple.
+The current adapter uses single-request `PutObject` and buffers complete
+objects. It does not impose its own object-size cap. Streaming and multipart
+support are deferred; the compaction protocol does not bound upper-level sizes.
 
 ## 14. Limits and defensive decoding
 
@@ -730,13 +719,13 @@ in v1. This keeps conditional-create behavior and failure handling simple.
   marshaled bytes are authoritative.
 - Reject empty append batches with `ErrEmptyBatch` before store I/O.
 - Require every stored event to be a nonempty JSON array.
-- Limit the complete batch's JSON array before upload.
-- Limit commit/node response bodies while reading.
-- Limit both compressed and decompressed segment sizes and reject trailing zstd
-  streams or trailing non-whitespace JSON.
+- Limit the complete batch's JSON array before any append I/O. The limit does
+  not apply to stored data; lowering it cannot break reads or future compaction.
+- Impose no compressed-object or decompressed-output byte limit.
+- Reject trailing zstd streams or trailing non-whitespace JSON.
 - Verify every parsed key remains under the configured normalized prefix; never
   follow absolute URLs or foreign-bucket references from stored data.
-- Require exactly 16 children in aggregate objects.
+- Require exactly `16^L` ordered records in a level-L segment.
 - Check all range arithmetic for overflow.
 - Do not trust ETag as a content hash. Use the protocol's SHA-256 fields.
 - Wrap errors with operation, bucket, key, and revision, but never include event
@@ -772,7 +761,7 @@ benchmarks even if production metrics hooks are deferred.
 - `lokv/s3store` AWS SDK v2 adapter;
 - head and historical revision loading;
 - empty and non-carry append;
-- packed segment and higher index creation;
+- packed segment creation at every level;
 - conflict, ambiguous-success, and retry handling.
 
 ### Phase 3: reads
@@ -780,7 +769,7 @@ benchmarks even if production metrics hooks are deferred.
 - full scan;
 - range pruning;
 - full verification;
-- bounded concurrency and size limits.
+- bounded GET concurrency and append batch admission limits.
 
 ### Phase 4: production hardening
 
@@ -814,7 +803,8 @@ At minimum:
 12. Range scans at block edges return exactly the requested revisions and avoid
     GETs for disjoint subtrees.
 13. Context cancellation stops retries and bounded concurrent GET work.
-14. Decoder limits reject oversized and decompression-bomb inputs.
+14. Reject oversized new batches before I/O; lowering the append limit must
+    preserve old reads and compaction. Test large and unknown-size zstd frames.
 15. A generic store conformance suite checks sorted limited listing, immediate
     create visibility, atomic values, exactly one winner, and sentinel errors.
 16. A live, general-purpose S3 adapter test confirms that `LIST MaxKeys=1` sees
@@ -822,9 +812,10 @@ At minimum:
     412/409 as appropriate.
 
 Run unit tests with both `go test ./...` and `go test -race ./...`; race builds
-reduce the large boundary and crash workloads to two carry levels. Add fuzz
-targets for key parsing, commit/node decoding, frontier validation, and segment
-decompression.
+reduce large packing, boundary, and crash workloads to two carry levels. A
+seeded level-4 test validates packing and full-scan request counts without
+building 65536 individual commits. Add fuzz targets for key parsing, commit and
+segment decoding, frontier validation, and segment decompression.
 
 ## 18. Acceptance criteria
 
@@ -864,17 +855,16 @@ numbers; timestamps may live inside `T` if useful.
 Rejected because rewriting `[1..N]` after every fixed-size tail produces
 quadratic aggregate history writes.
 
-### Physical LSM compaction at every level
+### Reference-only upper levels
 
-Rejected because the bucket never deletes old objects. Recopying event payload
-at every level would permanently retain every duplicate. This design packs event
-bytes only once at level 1 and uses reference-only nodes above it.
+Rejected because full scans still require approximately one data GET per 16
+batches, plus index requests. Packing complete payload ranges at every level
+lets clients read the frontier directly. This intentionally accepts greater
+write amplification and retained storage in the create-only store.
 
-### Index-only tree with no packed leaf
+### Index-only tree with no packed data
 
-Viable and even cheaper in bytes, but a full scan would still GET nearly every
-original commit object. Packing groups of 16 gives a useful GET reduction for
-one bounded extra copy of each event.
+Rejected because a full scan would GET nearly every original commit object.
 
 ### Separate mutation and head-manifest objects
 

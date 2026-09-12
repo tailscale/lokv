@@ -16,8 +16,6 @@ import (
 	"unicode/utf8"
 )
 
-const safetyCeiling int64 = 256 << 20
-
 // MaxRevision is the maximum revision and maximum number of batch records in a log.
 // It equals JavaScript's Number.MAX_SAFE_INTEGER (9007199254740991), so all valid
 // revisions can pass through JavaScript Numbers without losing precision.
@@ -29,17 +27,19 @@ const MaxRevision int64 = 1<<53 - 1
 type Config struct {
 	Prefix             string
 	Store              Store
-	MaxConflictRetries int   // Default 32; negative values are invalid. AppendTo never retries conflicts.
-	MaxEventBytes      int64 // Default 1 MiB for the complete batch's JSON array.
-	MaxObjectBytes     int64 // Default 64 MiB, both stored and decompressed; at most 256 MiB.
+	MaxConflictRetries int // Default 32; negative values are invalid. AppendTo never retries conflicts.
+
+	// MaxEventBytes limits the complete JSON array of a new append batch.
+	// Zero defaults to 1 MiB. It does not limit reads or compaction of stored data.
+	MaxEventBytes int64
 }
 
 // Log is a concurrency-safe handle to one namespace. Configuration is immutable.
 type Log[T any] struct {
-	store               Store
-	prefix              string
-	maxRetries          int
-	maxEvent, maxObject int64
+	store      Store
+	prefix     string
+	maxRetries int
+	maxEvent   int64
 }
 
 // Open validates configuration without I/O. The caller must ensure Store obeys
@@ -55,7 +55,7 @@ func Open[T any](cfg Config) (*Log[T], error) {
 			return nil, errors.New("lokv: nil store")
 		}
 	}
-	if cfg.MaxConflictRetries < 0 || cfg.MaxEventBytes < 0 || cfg.MaxObjectBytes < 0 {
+	if cfg.MaxConflictRetries < 0 || cfg.MaxEventBytes < 0 {
 		return nil, errors.New("lokv: negative configuration limit")
 	}
 	if cfg.MaxConflictRetries == 0 {
@@ -63,12 +63,6 @@ func Open[T any](cfg Config) (*Log[T], error) {
 	}
 	if cfg.MaxEventBytes == 0 {
 		cfg.MaxEventBytes = 1 << 20
-	}
-	if cfg.MaxObjectBytes == 0 {
-		cfg.MaxObjectBytes = 64 << 20
-	}
-	if cfg.MaxEventBytes > cfg.MaxObjectBytes || cfg.MaxObjectBytes > safetyCeiling {
-		return nil, errors.New("lokv: invalid size limits")
 	}
 	p := strings.Trim(cfg.Prefix, "/")
 	if !utf8.ValidString(p) || strings.ContainsAny(p, "\\") || strings.ContainsFunc(p, unicode.IsControl) {
@@ -82,7 +76,7 @@ func Open[T any](cfg Config) (*Log[T], error) {
 		}
 		p += "/"
 	}
-	return &Log[T]{cfg.Store, p, cfg.MaxConflictRetries, cfg.MaxEventBytes, cfg.MaxObjectBytes}, nil
+	return &Log[T]{cfg.Store, p, cfg.MaxConflictRetries, cfg.MaxEventBytes}, nil
 }
 
 // CommitID identifies an append invocation. It contains 16 cryptographically
@@ -190,13 +184,10 @@ func (lg *Log[T]) get(ctx context.Context, key string, referenced bool) ([]byte,
 	}
 	b, err := lg.store.Get(ctx, key)
 	if err != nil {
-		if referenced && (errors.Is(err, ErrNotFound) || errors.Is(err, ErrTooLarge)) {
+		if referenced && errors.Is(err, ErrNotFound) {
 			err = fmt.Errorf("%w: %w", ErrCorrupt, err)
 		}
 		return nil, fmt.Errorf("get %s: %w", key, err)
-	}
-	if int64(len(b)) > lg.maxObject {
-		return nil, fmt.Errorf("get %s: %w: %w", key, ErrCorrupt, ErrTooLarge)
 	}
 	return b, nil
 }
@@ -396,9 +387,6 @@ func (lg *Log[T]) appendPrepared(ctx context.Context, base *Snapshot[T], event j
 	body, err := json.Marshal(c)
 	if err != nil {
 		return nil, errors.New("lokv: encode commit")
-	}
-	if int64(len(body)) > lg.maxObject {
-		return nil, ErrTooLarge
 	}
 	key := lg.logKey(revision)
 	// Decode before publishing: a T with an incompatible UnmarshalJSON must not

@@ -101,12 +101,14 @@ Without transport retries or an application-provided cache, the costs are:
 | Poll an empty log | One LIST with limit 1 |
 | Poll an unchanged nonempty log | One LIST and one head GET; skip Scan |
 | Catch up exactly one new batch | One LIST and one head GET; Scan needs no further I/O |
-| Catch up several new batches | The head lookup, plus GETs for intersecting index nodes, segments, and raw tail commits |
+| Catch up several new batches | The head lookup, plus one GET per intersecting frontier segment or raw tail commit |
 
 The head contains its entire batch, so Scan never fetches it again. Disjoint
-historical subtrees are skipped. A partially overlapping segment is fetched and
-validated in full, including any older entries it contains; only the new entries
-are applied. The core does not cache objects between calls.
+historical ranges are skipped. Every segment contains its complete range,
+including at higher levels, so reading it needs no GETs for constituent objects.
+A partially overlapping segment is fetched and validated in full, including any
+older entries it contains; only the new entries are applied. The core does not
+cache objects between calls.
 
 `Log` and `Store` have no watch API. Run the example's `catchUp` closure from one
 goroutine using a ticker, an application-provided wakeup channel, or both:
@@ -161,20 +163,42 @@ catch-up scan fails, finish catching up before making decisions against its head
 There is no mutable HEAD. Reverse revision keys make one ascending `List` with
 limit 1 find the newest commit. A head read uses that LIST and one GET.
 
-A radix-16 frontier packs every completed group of 16 preceding batch records
-into one zstd segment. Higher levels contain references only. Appending revision 17
-creates a segment and a commit; revision 257 creates a segment, an index, and a
-commit. An ordinary append creates only its commit. For `N` records, successful
-single-writer creations total:
+A radix-16 frontier packs complete batch ranges into zstd segments at every
+level: level 1 contains 16 batches, level 2 contains 256, level 3 contains 4,096,
+and level 4 contains 65,536. Each segment contains the actual records in order.
+The head references up to 15 objects per level, plus its own batch.
+
+Appending revision 17 creates a level-1 segment and a commit; revision 257
+creates level-1 and level-2 segments and a commit. An ordinary append creates
+only its commit. For `N` records, successful single-writer creations total:
 
 ```text
 N + floor((N-1)/16) + floor((N-1)/256) + ...
 ```
 
-This approaches `16/15` creations per batch record. Event data is stored in its
-raw commit and, once its group closes, in one packed segment. Aggregate
-dependencies are created before the final conditional commit PUT, which
-publishes the whole batch.
+This approaches `16/15` creations per batch record. Each carry reads 16 child
+ranges, combines their record projections, and writes one compressed object.
+The prior head is reused when packing level 0. Aggregate dependencies are
+created before the final conditional commit PUT, which publishes the batch.
+Payloads are copied at each completed level, and older objects remain stored.
+This spends more storage and compaction work to reduce client download requests.
+
+For a new client, `LoadHead` followed by `Scan(..., lokv.All(), ...)` takes one
+LIST plus `1 + sum(hex digits of N-1)` GETs for `N > 0`, excluding transport
+retries. The empty log needs only the LIST. There are no recursive index reads:
+
+| Batch records | LISTs | GETs including the head |
+| ---: | ---: | ---: |
+| 16 | 1 | 16 |
+| 17 | 1 | 2 |
+| 257 | 1 | 2 |
+| 4,097 | 1 | 2 |
+| 65,537 | 1 | 2 |
+| 1,000,000 | 1 | 40 |
+
+For example, 65,537 batches fit in one level-4 segment plus the head. Scans
+currently fetch objects sequentially. A narrow range that intersects a large
+segment still downloads and validates that entire segment.
 
 Writers race to create the deterministic next-revision key. `Append` marshals
 once and retains one random commit ID through conflict retries. On a failed PUT,
@@ -231,16 +255,21 @@ of the current object.
 
 ## Limits and wire format
 
-Defaults are 32 conflict retries, 1 MiB for a batch's complete JSON array, and
-64 MiB for each stored or decompressed object. `MaxObjectBytes` may be increased
-up to 256 MiB, and `MaxEventBytes` must not exceed it. Configure the S3 adapter's object limit at
-least as high as the core limit. A segment's 16 batches and metadata must fit the
-object limit. A zero configuration limit selects its default; negative limits
-are rejected. Use `AppendTo` for an attempt without conflict retries.
+Defaults are 32 conflict retries and 1 MiB for a new batch's complete JSON
+array. `MaxEventBytes` is checked before append I/O. It does not limit stored
+records, so lowering it cannot prevent reading or compacting existing history.
+Zero selects the default; negative limits are rejected. Use `AppendTo` for an
+attempt without conflict retries.
 
-Commit and segment envelopes use `lokv/commit/v2` and `lokv/segment/v2` for batch
-events. Old v1 envelopes are rejected; they must not be interpreted as batches.
-The key layout, index envelope format, and record hash algorithm are unchanged.
+Compacted objects have no configured size limit in either the core or S3
+adapter. Compaction never rejects previously accepted data for exceeding a byte
+limit. The Store API and JSON implementation still buffer complete objects;
+streaming support is future work.
+
+Commit and segment envelopes use `lokv/commit/v3` and `lokv/segment/v3`.
+Earlier envelopes are rejected. Every nonzero level uses a `.json.zst` packed
+segment; there are no reference-only index objects. Commit keys and the record
+hash algorithm are unchanged.
 
 Prefix normalization strips leading and trailing slashes; empty prefixes work.
 Invalid UTF-8, control characters, backslashes, and empty or dot path components
@@ -248,10 +277,11 @@ are rejected. References must remain inside the normalized namespace.
 
 Readers validate required fields, fixed-width lowercase hex, digests, aligned
 ranges, frontier digits, record hashes, and chain boundaries. Unknown JSON fields
-are accepted; duplicate envelope fields, trailing JSON, concatenated zstd frames,
-and oversized input or decompressed output are rejected. Segments use zstd's
-default compression level, one encoder worker, a 1 MiB window, and checksums.
-Tail packing uses at most four concurrent GETs, joined before returning.
+are accepted; duplicate envelope fields, trailing JSON, and concatenated zstd
+frames are rejected. Segments use zstd's default compression level, one encoder
+worker, a 1 MiB window, and checksums. The window bounds compression history,
+not decompressed output. Packing uses at most four concurrent GETs, joined
+before returning.
 
 The complete protocol, key layout, and hash definition are in [DESIGN.md](DESIGN.md).
 
@@ -266,11 +296,13 @@ go test -run '^$' -bench . -benchmem
 
 Tests cover carry boundaries through revision 4097, request counts, concurrent
 writers, atomic batches, crash injection, ambiguous success, corruption, pruning,
-and resource limits. Under `-race`, the large boundary and crash tests use two
-carry levels (through revision 257); normal runs cover three. CI runs both modes. HTTP tests
-exercise the actual AWS SDK request headers and status mapping.
+and batch admission limits. A seeded level-4 packing test verifies that 65,537
+batches download with two GETs. Under `-race`, large packing, boundary, and crash
+workloads use two carry levels; normal runs retain the deeper coverage. CI runs
+both modes. HTTP tests exercise AWS SDK headers, status mapping, and packed
+full-scan request counts.
 Benchmarks report store requests and average carry depth alongside allocations.
-Fuzz targets cover key parsing, commit and index decoding, frontier validation,
+Fuzz targets cover key parsing, commit and segment decoding, frontier validation,
 and segment decompression; for example:
 
 ```sh

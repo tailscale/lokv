@@ -117,77 +117,62 @@ func TestAggregateValidation(t *testing.T) {
 	s := newStore()
 	lg := testLog[int](t, s)
 	snap := build(t, lg, 257)
-	indexRef := snap.commit.Frontier[0].Refs[0]
-	node, err := lg.decodeIndex(indexRef, s.objects[indexRef.Key])
+	old, err := lg.LoadRevision(context.Background(), 17)
 	if err != nil {
 		t.Fatal(err)
 	}
-	segRef := node.Children[0]
-	raw, err := lg.decompress(s.objects[segRef.Key])
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, mutate := range map[string]func(*segment){
-		"format": func(s *segment) { s.Format = "bad" }, "level": func(s *segment) { s.Level = 2 }, "count": func(s *segment) { s.Records = s.Records[:15] },
-		"range": func(s *segment) { s.End = hexRevision(17) }, "record hash": func(s *segment) { s.Records[3].RecordHash = zeroHash },
-		"chain": func(s *segment) {
-			p := &s.Records[3]
-			p.PreviousRecordHash = zeroHash
-			p.RecordHash = recordHash(4, p.CommitID, zeroHash, p.Event)
-		},
-		"order": func(s *segment) { s.Records[3], s.Records[4] = s.Records[4], s.Records[3] },
-	} {
-		t.Run("segment/"+name, func(t *testing.T) {
-			var seg segment
-			if err := json.Unmarshal(raw, &seg); err != nil {
-				t.Fatal(err)
-			}
-			mutate(&seg)
-			b, _ := json.Marshal(seg)
-			ref := segRef
-			ref.SHA256 = digest(b)
-			ref.Key = lg.treeKey(ref)
-			if _, err := lg.decodeSegment(ref, compressTest(t, b)); !errors.Is(err, ErrCorrupt) {
-				t.Fatal(err)
-			}
-		})
-	}
-	for name, mutate := range map[string]func(*indexNode){
-		"format": func(n *indexNode) { n.Format = "bad" }, "level": func(n *indexNode) { n.Level = 3 }, "count": func(n *indexNode) { n.Children = n.Children[:15] },
-		"range": func(n *indexNode) { n.End = hexRevision(254) }, "child level": func(n *indexNode) { n.Children[3].Level = 2 },
-		"adjacency": func(n *indexNode) { n.Children[3] = n.Children[4] }, "chain": func(n *indexNode) { n.Children[3].FirstPrevHash = zeroHash },
-		"boundary": func(n *indexNode) { n.Children[15].LastRecordHash = zeroHash },
-	} {
-		t.Run("index/"+name, func(t *testing.T) {
-			var n indexNode
-			if err := json.Unmarshal(s.objects[indexRef.Key], &n); err != nil {
-				t.Fatal(err)
-			}
-			mutate(&n)
-			b, _ := json.Marshal(n)
-			ref := indexRef
-			ref.SHA256 = digest(b)
-			ref.Key = lg.treeKey(ref)
-			if _, err := lg.decodeIndex(ref, b); !errors.Is(err, ErrCorrupt) {
-				t.Fatal(err)
-			}
-		})
-	}
-	// A correctly hashed segment with trailing JSON still must fail decoding.
-	b := append(bytes.Clone(raw), []byte(" {}")...)
-	ref := segRef
-	ref.SHA256 = digest(b)
-	ref.Key = lg.treeKey(ref)
-	if _, err := lg.decodeSegment(ref, compressTest(t, b)); !errors.Is(err, ErrCorrupt) {
-		t.Fatal(err)
+	for _, segRef := range []objectRef{old.commit.Frontier[0].Refs[0], snap.commit.Frontier[0].Refs[0]} {
+		raw, err := lg.decompress(s.objects[segRef.Key])
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, mutate := range map[string]func(*segment){
+			"format":      func(s *segment) { s.Format = "bad" },
+			"level":       func(s *segment) { s.Level++ },
+			"count":       func(s *segment) { s.Records = s.Records[:len(s.Records)-1] },
+			"range":       func(s *segment) { s.End = hexRevision(17) },
+			"record hash": func(s *segment) { s.Records[3].RecordHash = zeroHash },
+			"chain": func(s *segment) {
+				p := &s.Records[3]
+				p.PreviousRecordHash = zeroHash
+				p.RecordHash = recordHash(4, p.CommitID, zeroHash, p.Event)
+			},
+			"order": func(s *segment) { s.Records[3], s.Records[4] = s.Records[4], s.Records[3] },
+			"boundary": func(s *segment) {
+				p := &s.Records[len(s.Records)-1]
+				p.Event = json.RawMessage("[999]")
+				revision, _ := parseRevision(p.Revision)
+				p.RecordHash = recordHash(revision, p.CommitID, p.PreviousRecordHash, p.Event)
+			},
+		} {
+			t.Run(fmt.Sprintf("level%d/%s", segRef.Level, name), func(t *testing.T) {
+				var seg segment
+				if err := json.Unmarshal(raw, &seg); err != nil {
+					t.Fatal(err)
+				}
+				mutate(&seg)
+				b, _ := json.Marshal(seg)
+				ref := segRef
+				ref.SHA256 = digest(b)
+				ref.Key = lg.treeKey(ref)
+				if _, err := lg.decodeSegment(ref, compressTest(t, b)); !errors.Is(err, ErrCorrupt) {
+					t.Fatal(err)
+				}
+			})
+		}
+		// A correctly hashed segment with trailing JSON still must fail decoding.
+		b := append(bytes.Clone(raw), []byte(" {}")...)
+		ref := segRef
+		ref.SHA256 = digest(b)
+		ref.Key = lg.treeKey(ref)
+		if _, err := lg.decodeSegment(ref, compressTest(t, b)); !errors.Is(err, ErrCorrupt) {
+			t.Fatal(err)
+		}
 	}
 }
 
-func TestDecompressionLimits(t *testing.T) {
-	lg, err := Open[int](Config{Store: newStore(), MaxEventBytes: 1024, MaxObjectBytes: 4096})
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestDecompression(t *testing.T) {
+	lg := testLog[int](t, newStore())
 	valid := compressTest(t, []byte(`{"ok":true}`))
 	if raw, err := lg.decompress(valid); err != nil || string(raw) != `{"ok":true}` {
 		t.Fatal(string(raw), err)
@@ -201,12 +186,10 @@ func TestDecompressionLimits(t *testing.T) {
 			}
 		})
 	}
-	bomb := compressTest(t, bytes.Repeat([]byte("a"), 1<<20))
-	if _, err := lg.decompress(bomb); !errors.Is(err, ErrTooLarge) || !errors.Is(err, ErrCorrupt) {
-		t.Fatal(err)
-	}
-	if _, err := lg.decompress(bytes.Repeat([]byte("a"), 4097)); !errors.Is(err, ErrTooLarge) {
-		t.Fatal(err)
+	// Output may exceed both the batch admission limit and the compression window.
+	want := bytes.Repeat([]byte("a"), 2<<20)
+	if got, err := lg.decompress(compressTest(t, want)); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("large output: %v", err)
 	}
 	// A streaming frame need not advertise its decompressed size.
 	var buf bytes.Buffer
@@ -214,14 +197,14 @@ func TestDecompressionLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := enc.Write(bytes.Repeat([]byte("a"), 1<<20)); err != nil {
+	if _, err := enc.Write(want); err != nil {
 		t.Fatal(err)
 	}
 	if err := enc.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := lg.decompress(buf.Bytes()); !errors.Is(err, ErrTooLarge) {
-		t.Fatal(err)
+	if got, err := lg.decompress(buf.Bytes()); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("streaming frame: %v", err)
 	}
 }
 
@@ -455,7 +438,7 @@ func TestEventBytesAndCaseAliases(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	b := append([]byte(`{"Format":"lokv/commit/v2",`), s.body[1:]...)
+	b := append([]byte(`{"Format":"lokv/commit/v3",`), s.body[1:]...)
 	if _, err := lg.decodeCommit(lg.logKey(1), b); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
@@ -465,28 +448,53 @@ func TestEventBytesAndCaseAliases(t *testing.T) {
 	}
 }
 
-func TestAggregateEventLimit(t *testing.T) {
+func TestAppendLimitDoesNotLimitHistory(t *testing.T) {
 	s := newStore()
-	lg, err := Open[string](Config{Store: s, MaxEventBytes: 2000, MaxObjectBytes: 16000})
+	lg, err := Open[string](Config{Store: s, MaxEventBytes: 2000})
 	if err != nil {
 		t.Fatal(err)
 	}
+	ctx := context.Background()
+	value := strings.Repeat("x", 1500)
 	var snap *Snapshot[string]
-	for i := 0; i < 16; i++ {
-		snap, err = lg.AppendTo(context.Background(), snap, strings.Repeat("x", 1500))
+	for i := 0; i < 256; i++ {
+		snap, err = lg.AppendTo(ctx, snap, value)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	creates := s.creates
-	if _, err := lg.AppendTo(context.Background(), snap, "next"); !errors.Is(err, ErrTooLarge) {
+	// Lowering the append limit must not prevent reading old batches or packing
+	// them into a larger segment at the next carry.
+	lg, err = Open[string](Config{Store: s, MaxEventBytes: 4})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if s.creates != creates {
-		t.Fatal("oversized segment was uploaded")
-	}
-	head, err := lg.LoadHead(context.Background())
-	if err != nil || head.Revision() != 16 {
+	snap, err = lg.LoadHead(ctx)
+	if err != nil {
 		t.Fatal(err)
+	}
+	snap, err = lg.AppendTo(ctx, snap, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	if err := lg.Scan(ctx, snap, All(), func(r Record[string]) error {
+		want := value
+		if r.Revision == 257 {
+			want = ""
+		}
+		if len(r.Value) != 1 || r.Value[0] != want {
+			t.Fatalf("batch %d changed", r.Revision)
+		}
+		seen++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if seen != 257 {
+		t.Fatalf("read %d batches, want 257", seen)
+	}
+	if _, err := lg.AppendTo(ctx, snap, "x"); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("new batch bypassed its admission limit: %v", err)
 	}
 }

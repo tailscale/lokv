@@ -182,14 +182,16 @@ func TestBatchWireValidation(t *testing.T) {
 			t.Fatalf("accepted non-batch event %q: %v", event, err)
 		}
 	}
-	// An old array-valued event is not an atomic batch in the new format.
-	c := *snap.commit
-	c.Format = "lokv/commit/v1"
-	body, err := json.Marshal(c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := lg.decodeCommit(lg.logKey(1), body); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("accepted old commit format: %v", err)
+	// v1 arrays had different batch semantics; v2 used reference-only upper levels.
+	for _, format := range []string{"lokv/commit/v1", "lokv/commit/v2"} {
+		c := *snap.commit
+		c.Format = format
+		body, err := json.Marshal(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := lg.decodeCommit(lg.logKey(1), body); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("accepted %s: %v", format, err)
+		}
 	}
 }

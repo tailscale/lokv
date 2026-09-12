@@ -30,6 +30,7 @@ type httpAPI struct {
 	failures       map[string][]int
 	puts           map[string]int
 	listLimits     []int
+	getKeys        []string
 	badConditional bool
 	cancel         context.CancelFunc
 }
@@ -113,6 +114,7 @@ func (a *httpAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_ = xml.NewEncoder(w).Encode(result)
 			return
 		}
+		a.getKeys = append(a.getKeys, key)
 		b, ok := a.objects[key]
 		if !ok {
 			fail(404)
@@ -157,32 +159,50 @@ func TestHTTPHeadAndCarries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 17; i++ {
-		if _, err := lg.Append(context.Background(), i, i+100); err != nil {
+	var base *lokv.Snapshot[int]
+	for i := 0; i < 257; i++ {
+		base, err = lg.AppendTo(context.Background(), base, i, i+1000)
+		if err != nil {
 			t.Fatal(err)
 		}
 	}
+	api.mu.Lock()
+	api.getKeys = nil
+	api.mu.Unlock()
 	snap, err := lg.LoadHead(context.Background())
-	if err != nil || snap.Revision() != 17 {
+	if err != nil || snap.Revision() != 257 {
 		t.Fatalf("head: %v", err)
 	}
-	if !slices.Equal(snap.Record().Value, []int{16, 116}) {
+	if !slices.Equal(snap.Record().Value, []int{256, 1256}) {
 		t.Fatalf("head batch: %v", snap.Record().Value)
 	}
-	if err := lg.Verify(context.Background(), snap); err != nil {
+	seen := 0
+	if err := lg.Scan(context.Background(), snap, lokv.All(), func(r lokv.Record[int]) error {
+		if !slices.Equal(r.Value, []int{seen, seen + 1000}) {
+			t.Fatalf("batch %d changed: %v", r.Revision, r.Value)
+		}
+		seen++
+		return nil
+	}); err != nil {
 		t.Fatal(err)
+	}
+	if seen != 257 {
+		t.Fatalf("scan returned %d batches", seen)
 	}
 	api.mu.Lock()
 	defer api.mu.Unlock()
-	if len(api.objects) != 18 {
-		t.Fatalf("34 values in 17 batches created %d objects; want 17 commits and 1 segment", len(api.objects))
+	if len(api.objects) != 274 {
+		t.Fatalf("514 values in 257 batches created %d objects; want 257 commits and 17 segments", len(api.objects))
+	}
+	if len(api.getKeys) != 2 || !strings.Contains(api.getKeys[1], "/tree/2/") || !strings.HasSuffix(api.getKeys[1], ".json.zst") {
+		t.Fatalf("cold scan GETs: %v", api.getKeys)
 	}
 	for _, limit := range api.listLimits {
 		if limit != 1 {
 			t.Fatal("HEAD LIST MaxKeys was not 1")
 		}
 	}
-	if len(api.puts) != 18 || api.badConditional {
+	if len(api.puts) != 274 || api.badConditional {
 		t.Fatalf("creations %d conditional %v", len(api.puts), !api.badConditional)
 	}
 }
@@ -231,19 +251,6 @@ func TestHTTPRetryCancellation(t *testing.T) {
 	}
 }
 
-func TestHTTPBoundedGet(t *testing.T) {
-	api := newAPI()
-	api.objects["large"] = []byte("123456789")
-	store := httpStore(t, api)
-	store.maxObject = 8
-	if _, err := store.Get(context.Background(), "large"); !errors.Is(err, lokv.ErrTooLarge) {
-		t.Fatal(err)
-	}
-	if err := store.Create(context.Background(), "large", []byte("123456789")); !errors.Is(err, lokv.ErrTooLarge) {
-		t.Fatal(err)
-	}
-}
-
 func TestHTTPPagination(t *testing.T) {
 	api := newAPI()
 	for i := 0; i < 1005; i++ {
@@ -285,17 +292,17 @@ type trackedBody struct {
 
 func (b *trackedBody) Close() error { b.closed = true; return nil }
 
-func TestGetBoundsWithoutContentLength(t *testing.T) {
+func TestGetWithoutContentLength(t *testing.T) {
 	body := &trackedBody{Reader: strings.NewReader("123456789")}
 	client := &fakeClient{get: func(context.Context, *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
 		return &s3.GetObjectOutput{Body: body}, nil
 	}}
-	store, err := New(Config{Client: client, Bucket: "test-bucket", MaxObjectBytes: 8})
+	store, err := New(Config{Client: client, Bucket: "test-bucket"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Get(context.Background(), "key"); !errors.Is(err, lokv.ErrTooLarge) {
-		t.Fatal(err)
+	if got, err := store.Get(context.Background(), "key"); err != nil || string(got) != "123456789" {
+		t.Fatalf("Get = %q, %v", got, err)
 	}
 	if !body.closed {
 		t.Fatal("body leaked")

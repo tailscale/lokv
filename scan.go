@@ -50,15 +50,18 @@ func After(revision int64) Range {
 // future records. It validates each fetched object, including complete segments
 // that partially intersect the range. Disjoint subtrees are skipped.
 // Each callback receives one entire batch; ranges and revisions count batches,
-// not individual values within them.
+// not individual values within them. For N > 0 records, a full scan uses the sum
+// of the hexadecimal digits of N-1 Get calls, in addition to loading the snapshot.
 //
 // The follow example shows an initial full scan into an in-memory index and
 // later catch-up scans. Keep the last successfully applied revision and scan
 // only the interval after it. Scan performs no List calls and does not refetch
 // the snapshot's own record: a range containing only that record needs no I/O.
-// Other reads are limited to intersecting index nodes, packed segments, and raw
-// tail commits. A segment is read and validated in full even when its first few
-// records were already applied; only requested records reach yield.
+// Other reads are limited to intersecting packed segments and raw tail commits.
+// Every segment contains its complete range, even at higher levels, so each
+// intersecting frontier reference requires just one Get. A segment is read and
+// validated in full even when some records were already applied; only requested
+// records reach yield.
 //
 // Successfully yielded records are not rolled back if a later read or callback
 // fails. Advance an application's last-applied revision only after the entire
@@ -114,8 +117,7 @@ func (lg *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield fu
 		}
 		return nil
 	}
-	var visit func(objectRef) error
-	visit = func(ref objectRef) error {
+	visit := func(ref objectRef) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -126,35 +128,12 @@ func (lg *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield fu
 		if end < r.First || start > r.Last {
 			return nil
 		}
-		if ref.Level == 0 {
-			c, err := lg.loadCommitRef(ctx, ref, nil)
-			if err != nil {
-				return fmt.Errorf("scan %s: %w", ref.Key, err)
-			}
-			return emit(c.project())
-		}
-		body, err := lg.get(ctx, ref.Key, true)
-		if err != nil {
-			return err
-		}
-		if ref.Level == 1 {
-			seg, err := lg.decodeSegment(ref, body)
-			if err != nil {
-				return fmt.Errorf("scan %s: %w", ref.Key, err)
-			}
-			for _, p := range seg.Records {
-				if err := emit(p); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-		node, err := lg.decodeIndex(ref, body)
+		records, err := lg.loadRecords(ctx, ref, nil)
 		if err != nil {
 			return fmt.Errorf("scan %s: %w", ref.Key, err)
 		}
-		for _, child := range node.Children {
-			if err := visit(child); err != nil {
+		for _, p := range records {
+			if err := emit(p); err != nil {
 				return err
 			}
 		}
