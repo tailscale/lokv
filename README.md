@@ -247,26 +247,3 @@ Give each origin its own cache directory. There is no automatic eviction;
 the cache is disposable and can be removed while clients are stopped. See the
 [cachestore documentation](https://pkg.go.dev/github.com/tailscale/lokv/cachestore)
 and its executable example for streaming, error handling, and ownership details.
-
-## Validation
-
-```sh
-go test ./...
-go test -race ./...
-go vet ./...
-go test -run '^$' -bench . -benchmem
-```
-
-Tests cover atomic batches, concurrent writers, conflict retries, corruption,
-stream ownership, and recovery from interrupted operations. Benchmarks measure
-request counts, compaction costs, and memory use. Parser fuzz targets are in
-[fuzz_test.go](fuzz_test.go).
-
-The live S3 test is opt-in and **permanently writes objects** under a unique
-`lokv-integration/` prefix. It never cleans them up. Supply a general-purpose
-test bucket, suitable permissions, and standard AWS credentials/region:
-
-```sh
-LOKV_S3_INTEGRATION=1 LOKV_S3_BUCKET=my-test-bucket \
-  go test ./s3store -run '^TestLiveS3$' -v
-```
