@@ -51,6 +51,13 @@ type Config struct {
 	// MaxEventBytes limits the complete JSON array of a new append batch.
 	// Zero defaults to 1 MiB. It does not limit reads or compaction of stored data.
 	MaxEventBytes int64
+
+	// TempDir selects the directory for temporary downloads, validated records,
+	// and pending compaction uploads. Empty uses the operating system default.
+	// The directory must already exist when temporary storage is needed. Files
+	// are unlinked immediately on non-Windows systems and removed on close on
+	// Windows. Allow space for concurrent operations; see DESIGN.md for costs.
+	TempDir string
 }
 
 // Log is a concurrency-safe handle to one namespace. Configuration is immutable.
@@ -59,6 +66,7 @@ type Log[T any] struct {
 	prefix     string
 	maxRetries int
 	maxEvent   int64
+	newTemp    func() (*tempFile, error)
 }
 
 // Open validates configuration without I/O. The caller must ensure Store obeys
@@ -98,7 +106,10 @@ func Open[T any](cfg Config) (*Log[T], error) {
 		}
 		p += "/"
 	}
-	return &Log[T]{cfg.Store, p, cfg.MaxConflictRetries, cfg.MaxEventBytes}, nil
+	return &Log[T]{
+		store: cfg.Store, prefix: p, maxRetries: cfg.MaxConflictRetries, maxEvent: cfg.MaxEventBytes,
+		newTemp: func() (*tempFile, error) { return newTempFileIn(cfg.TempDir) },
+	}, nil
 }
 
 // CommitID identifies an append invocation. It contains 16 cryptographically

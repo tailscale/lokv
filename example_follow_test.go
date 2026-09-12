@@ -87,8 +87,9 @@ func ExampleLog_Scan_follow() {
 
 	// A poll with no new entries still uses LoadHead's one List and one Get,
 	// but skips Scan. A poll with exactly one new batch needs no extra Get for
-	// Scan: the head already contains that batch. A larger catch-up reads only
-	// intersecting tree objects; a packed segment may also contain older entries.
+	// Scan: the head already contains that batch. Larger catch-ups choose between
+	// packed ranges and historical roots with smaller ranges. A short catch-up
+	// across a large carry need not download the whole compacted history.
 	if err := catchUp(); err != nil {
 		panic(err)
 	}

@@ -42,7 +42,7 @@ func (f *recordFile) each(ctx context.Context, yield func(projection) error) err
 	}
 }
 
-func (lg *Log[T]) readRecords(ctx context.Context, ref objectRef, base *Snapshot[T], yield func(projection) error) error {
+func (lg *Log[T]) readRecords(ctx context.Context, ref objectRef, base *Snapshot[T], yield func(projection) error) (err error) {
 	if ref.Level == 0 {
 		c, err := lg.loadCommitRef(ctx, ref, base)
 		if err != nil {
@@ -54,7 +54,7 @@ func (lg *Log[T]) readRecords(ctx context.Context, ref objectRef, base *Snapshot
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { err = errors.Join(err, f.Close()) }()
 	return f.each(ctx, yield)
 }
 
@@ -69,10 +69,10 @@ func (lg *Log[T]) download(ctx context.Context, ref objectRef) (_ *tempFile, err
 	defer func() {
 		err = errors.Join(err, body.Close())
 		if err != nil && f != nil {
-			f.Close()
+			err = errors.Join(err, f.Close())
 		}
 	}()
-	f, err = newTempFile()
+	f, err = lg.newTemp()
 	if err != nil {
 		return nil, err
 	}
@@ -86,13 +86,13 @@ func (lg *Log[T]) loadRecordFile(ctx context.Context, ref objectRef, base *Snaps
 	if _, _, err := lg.validateRef(ref); err != nil {
 		return nil, err
 	}
-	f, err := newTempFile()
+	f, err := lg.newTemp()
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		if err != nil {
-			f.Close()
+			err = errors.Join(err, f.Close())
 		}
 	}()
 	enc := jsontext.NewEncoder(contextWriter{ctx, f}, json.DefaultOptionsV1())
@@ -111,11 +111,11 @@ func (lg *Log[T]) loadRecordFile(ctx context.Context, ref objectRef, base *Snaps
 			return nil, err
 		}
 	} else {
-		body, err := lg.download(ctx, ref)
-		if err != nil {
-			return nil, err
+		body, downloadErr := lg.download(ctx, ref)
+		if downloadErr != nil {
+			return nil, downloadErr
 		}
-		defer body.Close()
+		defer func() { err = errors.Join(err, body.Close()) }()
 		if err := lg.decodeSegment(ctx, ref, body, emit); err != nil {
 			return nil, err
 		}
@@ -154,7 +154,7 @@ func (s segmentStream) MarshalJSONTo(enc *jsontext.Encoder) error {
 	return enc.WriteToken(jsontext.EndObject)
 }
 
-func (lg *Log[T]) createSegment(ctx context.Context, children []objectRef, base *Snapshot[T]) (objectRef, error) {
+func (lg *Log[T]) createSegment(ctx context.Context, children []objectRef, base *Snapshot[T]) (_ objectRef, err error) {
 	if len(children) != 16 {
 		return objectRef{}, corrupt("invalid compaction child count")
 	}
@@ -163,43 +163,15 @@ func (lg *Log[T]) createSegment(ctx context.Context, children []objectRef, base 
 	defer func() {
 		for _, part := range parts {
 			if part != nil {
-				part.Close()
+				err = errors.Join(err, part.Close())
 			}
 		}
 	}()
-	workCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var wg sync.WaitGroup
-	var once sync.Once
-	var firstErr error
-	// Four workers bound codec buffers and batch memory, regardless of level.
-	for worker := 0; worker < 4; worker++ {
-		wg.Go(func() {
-			for i := worker; i < 16; i += 4 {
-				if workCtx.Err() != nil {
-					return
-				}
-				part, err := lg.loadRecordFile(workCtx, children[i], base)
-				if err != nil {
-					once.Do(func() { firstErr = err; cancel() })
-					return
-				}
-				parts[i] = part
-			}
-		})
-	}
-	wg.Wait()
-	if firstErr != nil {
-		return objectRef{}, firstErr
-	}
-	if err := ctx.Err(); err != nil {
-		return objectRef{}, err
-	}
-	body, err := newTempFile()
+	body, err := lg.newTemp()
 	if err != nil {
 		return objectRef{}, err
 	}
-	defer body.Close()
+	defer func() { err = errors.Join(err, body.Close()) }()
 	enc, err := zstd.NewWriter(contextWriter{ctx, body}, zstd.WithEncoderConcurrency(1), zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithWindowSize(1<<20), zstd.WithEncoderCRC(true))
 	if err != nil {
 		return objectRef{}, err
@@ -212,22 +184,45 @@ func (lg *Log[T]) createSegment(ctx context.Context, children []objectRef, base 
 	}
 	chain := ref.FirstPrevHash
 	stream := segmentStream{ref, func(yield func(projection) error) error {
-		for i, part := range parts {
-			if err := part.each(ctx, func(p projection) error {
-				if p.Revision != hexRevision(next) || p.PreviousRecordHash != chain {
-					return corrupt("compaction adjacency mismatch")
+		// Load four children at a time. Consuming and closing each group before
+		// fetching the next keeps scratch usage below a whole expanded segment.
+		for group := 0; group < len(children); group += 4 {
+			workCtx, cancel := context.WithCancelCause(ctx)
+			var wg sync.WaitGroup
+			for i := group; i < group+4; i++ {
+				wg.Go(func() {
+					part, err := lg.loadRecordFile(workCtx, children[i], base)
+					if err != nil {
+						cancel(err)
+						return
+					}
+					parts[i] = part
+				})
+			}
+			wg.Wait()
+			err := context.Cause(workCtx)
+			cancel(nil)
+			if err != nil {
+				return err
+			}
+			for i := group; i < group+4; i++ {
+				part := parts[i]
+				if err := part.each(ctx, func(p projection) error {
+					if p.Revision != hexRevision(next) || p.PreviousRecordHash != chain {
+						return corrupt("compaction adjacency mismatch")
+					}
+					chain = p.RecordHash
+					next++
+					return yield(p)
+				}); err != nil {
+					return err
 				}
-				chain = p.RecordHash
-				next++
-				return yield(p)
-			}); err != nil {
-				return err
-			}
-			if err := part.Close(); err != nil {
+				if err := part.Close(); err != nil {
+					parts[i] = nil
+					return err
+				}
 				parts[i] = nil
-				return err
 			}
-			parts[i] = nil
 		}
 		end, err := parseRevision(ref.End)
 		if err != nil || next != end+1 || chain != ref.LastRecordHash {
@@ -251,7 +246,7 @@ func (lg *Log[T]) createSegment(ctx context.Context, children []objectRef, base 
 	return ref, nil
 }
 
-func (lg *Log[T]) createAggregate(ctx context.Context, ref objectRef, body SizeReaderAt) error {
+func (lg *Log[T]) createAggregate(ctx context.Context, ref objectRef, body SizeReaderAt) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -266,7 +261,7 @@ func (lg *Log[T]) createAggregate(ctx context.Context, ref objectRef, body SizeR
 		}
 		return err
 	}
-	defer actual.Close()
+	defer func() { err = errors.Join(err, actual.Close()) }()
 	return lg.decodeSegment(ctx, ref, actual, nil)
 }
 

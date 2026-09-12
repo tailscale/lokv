@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 )
 
@@ -249,4 +251,171 @@ func TestCompactionTempCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkTempCleanup(t, dir)
+}
+
+type faultyTemp struct {
+	tempHandle
+	remaining int
+	writeErr  error
+	closeErr  error
+}
+
+func (f *faultyTemp) Write(p []byte) (int, error) {
+	if f.writeErr == nil {
+		return f.tempHandle.Write(p)
+	}
+	n, err := f.tempHandle.Write(p[:min(len(p), f.remaining)])
+	f.remaining -= n
+	if err != nil {
+		return n, err
+	}
+	if n < len(p) {
+		return n, f.writeErr
+	}
+	return n, nil
+}
+
+func (f *faultyTemp) Close() error {
+	return errors.Join(f.tempHandle.Close(), f.closeErr)
+}
+
+func TestCompactionDiskFailures(t *testing.T) {
+	for _, kind := range []string{"create", "output write", "spool write", "output close", "spool close"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := t.TempDir()
+			store := newStore()
+			lg, err := Open[int](Config{Store: store, TempDir: dir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			base := build(t, lg, 16)
+			failure := &os.PathError{Op: "write", Path: dir, Err: syscall.ENOSPC}
+			original := lg.newTemp
+			var created atomic.Int32
+			lg.newTemp = func() (*tempFile, error) {
+				n := created.Add(1)
+				if kind == "create" {
+					return nil, failure
+				}
+				f, err := original()
+				if err != nil {
+					return nil, err
+				}
+				// The output is created first; the following four are the
+				// first group of validated child spools, in worker order.
+				if strings.HasPrefix(kind, "output") && n == 1 || strings.HasPrefix(kind, "spool") && n == 2 {
+					fault := &faultyTemp{tempHandle: f.file, remaining: 8}
+					if strings.HasSuffix(kind, "write") {
+						fault.writeErr = failure
+					} else {
+						fault.closeErr = failure
+					}
+					f.file = fault
+				}
+				return f, nil
+			}
+			if _, err := lg.AppendTo(t.Context(), base, 16); !errors.Is(err, failure) {
+				t.Fatalf("append did not report disk failure: %v", err)
+			}
+			if _, ok := store.objects[lg.logKey(17)]; ok {
+				t.Fatal("published commit after temporary storage failure")
+			}
+			checkTempCleanup(t, dir)
+			lg.newTemp = original
+			snap, err := lg.AppendTo(t.Context(), base, 16)
+			if err != nil || snap.Revision() != 17 {
+				t.Fatalf("retry: %v, %v", snap, err)
+			}
+			if err := lg.Verify(t.Context(), snap); err != nil {
+				t.Fatal(err)
+			}
+			checkTempCleanup(t, dir)
+		})
+	}
+}
+
+func TestScanDiskFailures(t *testing.T) {
+	for _, phase := range []string{"download write", "download close", "spool write", "spool close"} {
+		t.Run(phase, func(t *testing.T) {
+			dir := t.TempDir()
+			store := newStore()
+			lg, err := Open[int](Config{Store: store, TempDir: dir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snap := build(t, lg, 17)
+			failure := errors.New("temporary disk failure")
+			original := lg.newTemp
+			created := 0
+			lg.newTemp = func() (*tempFile, error) {
+				created++
+				f, err := original()
+				if err != nil {
+					return nil, err
+				}
+				if strings.HasPrefix(phase, "spool") && created == 1 || strings.HasPrefix(phase, "download") && created == 2 {
+					fault := &faultyTemp{tempHandle: f.file, remaining: 8}
+					if strings.HasSuffix(phase, "write") {
+						fault.writeErr = failure
+					} else {
+						fault.closeErr = failure
+					}
+					f.file = fault
+				}
+				return f, nil
+			}
+			calls := 0
+			err = lg.Scan(t.Context(), snap, All(), func(Record[int]) error { calls++; return nil })
+			if !errors.Is(err, failure) || phase != "spool close" && calls != 0 {
+				t.Fatalf("scan: calls=%d, err=%v", calls, err)
+			}
+			checkTempCleanup(t, dir)
+		})
+	}
+}
+
+func TestTempDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "not-created-yet")
+	store := newStore()
+	lg, err := Open[int](Config{Store: store, TempDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := build(t, lg, 16)
+	if _, err := lg.AppendTo(t.Context(), base, 16); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing scratch directory: %v", err)
+	}
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lg.AppendTo(t.Context(), base, 16); err != nil {
+		t.Fatal(err)
+	}
+	checkTempCleanup(t, dir)
+}
+
+func TestCompactionScratchBound(t *testing.T) {
+	store := newStore()
+	fixture := newRangeFixture(t, store, 2)
+	var children []objectRef
+	for start := int64(1); start <= 256; start += 16 {
+		children = append(children, fixture.ref(start, 1))
+	}
+	var expanded int64
+	for _, p := range fixture.records[:256] {
+		body, err := json.Marshal(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expanded += int64(len(body) + 1)
+	}
+	stats := &scratchStats{}
+	original := fixture.lg.newTemp
+	fixture.lg.newTemp = func() (*tempFile, error) { return stats.create(original) }
+	if _, err := fixture.lg.createSegment(t.Context(), children, nil); err != nil {
+		t.Fatal(err)
+	}
+	if stats.live != 0 || stats.peak >= expanded*3/4 {
+		t.Fatalf("scratch live=%d peak=%d; expanded range=%d", stats.live, stats.peak, expanded)
+	}
 }

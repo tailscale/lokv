@@ -118,8 +118,8 @@ func (s *State[T, S]) Sync(ctx context.Context) (*Snapshot[T], error) {
 // value and revision match snap, which can then be used with [Log.AppendTo].
 //
 // SyncTo performs no head lookup. Applying a [Log.AppendTo] result one
-// revision ahead of the state needs no store I/O. Other scans read only objects
-// intersecting the unapplied range, as described by [Log.Scan]. On error, a retry
+// revision ahead of the state needs no store I/O. Larger catch-ups use
+// [Log.Scan]'s choice of packed ranges and historical roots. On error, a retry
 // resumes after the last successful batch unless apply poisoned the State.
 // If [State.Err] is non-nil, SyncTo returns it without I/O or further apply calls,
 // even if ctx is canceled or snap is invalid.

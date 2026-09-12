@@ -410,10 +410,13 @@ Object sizes are unbounded. Transfers, record arrays, and zstd encoding/decoding
 are streamed. Commits and individual batches remain buffered, but higher-level
 segments never materialize whole-range byte arrays or projection slices.
 
-Temporary files live in os.TempDir. On non-Windows systems, unlink each file
-immediately after creation and use its open descriptor. On Windows, close it
-before removing its name. All success, failure, and cancellation paths clean up
-owned files and response streams.
+Temporary files live in `Config.TempDir`, or `os.TempDir` when it is empty.
+On non-Windows systems, unlink each file immediately after creation and use its
+open descriptor. On Windows, close it before removing its name. All success,
+failure, and cancellation paths clean up owned files and response streams.
+File and response close errors are reported, including on otherwise successful
+operations. Failed cleanup can leave named files on Windows; inspect and clean
+the application's scratch directory after addressing the filesystem error.
 
 Downloads spool compressed bytes to a file, check zstd framing using fixed-size
 ReadAt calls, then decode and hash the stream while writing projections to a
@@ -579,12 +582,15 @@ store.Create(logKey(R+1), newCommit) // publish last
 
 Creating a packed segment requires all records from 16 children. At level 1,
 children are raw commits; the prior head body is already loaded and reused. At
-higher levels, children are packed segments. Fetch with at most four concurrent
-GETs, decoding and validating each child into a private record spool. Replay
-those spools in range order through a streaming JSON encoder, hasher, and zstd
-encoder into the temporary upload file. Close each input spool after consuming
-it. Validate record count, adjacency, and hash boundaries before publication;
-no whole-range projection slice or JSON byte slice is built.
+higher levels, children are packed segments. Process four children at a time,
+using at most four concurrent GETs and decoding each into a validated private
+record spool. Replay the group in range order through a streaming JSON encoder,
+hasher, and zstd encoder into the temporary upload file. Close these input
+spools before fetching the next group. This bounds expanded scratch data to
+four children, rather than all sixteen. Validate record count, adjacency, and
+hash boundaries before publication; no whole-range projection slice or JSON
+byte slice is built. A disk or cleanup error stops the carry before the new
+commit is published, even if a completed aggregate has already been created.
 
 Aggregate writes are also conditional creates. If `Create` returns `ErrExists`, GET
 and validate it, then treat it as success. Concurrent writers based on the same
@@ -630,17 +636,43 @@ To read a snapshot in chronological order:
 6. Yield the snapshot commit's own record last.
 
 For a range scan, compare the requested inclusive range with each reference's
-`start..end` and skip disjoint ranges. A partially intersecting segment at any
-level is downloaded, decompressed, and validated in full using disk spools,
-then replayed and filtered by revision. Public callbacks never receive records
-from a segment that fails validation, even at its end. All frontier objects
-are fetched sequentially, and callback failures close all owned spools.
+`start..end` and skip disjoint ranges. A fully included segment uses one GET.
+For an intersection that includes the segment's end, compare reading the packed
+segment with loading the raw commit at its end. That historical commit's
+frontier splits the range into fifteen objects at each lower level, followed
+by the commit's own record.
+Recursively choose cheaper representations for the intersecting smaller ranges.
+An intersection ending before the segment's end uses the packed object: its
+digest anchors the requested records without needing a separate chain proof.
+This uses deterministic commit keys and requires no additional LIST operations.
+Every historical root remains at or below the original snapshot's revision.
 
-Normal `Scan` validates every fetched object's content digest, format, level,
-range, internal adjacency, record hashes, and the hash-chain boundary between
-successive yielded records. `Verify` additionally walks the entire snapshot and
-checks every canonical-frontier invariant. Do not silently skip corrupt data or
-fall back to raw objects unless a separately named recovery API is added later.
+Choose the representation before I/O. The private cost estimate charges one
+head-sized batch plus 64 bytes of compressed metadata per record, 384 bytes
+per raw commit frontier reference, and a 64 KiB allowance per GET for request
+overhead. Frontier reference counts follow directly from revision digits, so
+planning needs no metadata requests. These estimates consider both transfer
+and request costs but cannot know actual historical batch sizes, compression,
+or network latency. They are a heuristic, not a minimum-byte guarantee.
+
+Before using a historical root, validate its commit and canonical frontier,
+check its record hash against the original segment's last-record hash, and
+check that its smaller refs reproduce the segment's interval and first/last
+hash boundaries. Raw refs retain their object-digest checks. The historical
+frontier itself is not covered by its record's logical hash, so spool the
+selected suffix and validate every record link through the original segment's
+known last-record hash before exposing it to callbacks. The single end record
+needs no spool because its logical hash is already the known anchor. Each
+fetched packed segment is also validated in full before use. Only requested
+revisions are emitted, in order. Callback failures close all owned spools.
+
+Normal `Scan` validates object digests when a reference supplies them, plus
+format, level, range, internal adjacency, record hashes, and the hash-chain
+boundary between successive yielded records. Historical end commits are
+anchored by their logical record hash. `Verify` always walks the original
+packed snapshot and checks every canonical-frontier invariant. Adaptive scans do not verify
+representations they did not read. A missing or corrupt object in the chosen
+path fails the operation; never switch representations to hide the error.
 
 Historical read is straightforward: `LoadRevision(R)` GETs the deterministic
 commit key and uses its embedded frontier. It never consults current HEAD.
@@ -686,12 +718,104 @@ For `N` appended batch records (regardless of the number of items per batch):
 - at `N = 1000000`, the frontier has 15 level-4, 4 level-3, 2 level-2,
   3 level-1, and 15 level-0 references: 40 GETs including the head.
 
-These counts exclude retries. Empty-log discovery needs only one LIST.
-Scans never fetch the constituent lower-level objects of a packed segment.
+These full-scan counts exclude retries. Empty-log discovery needs only one LIST.
+Partial scans can instead read historical roots and smaller ranges. At revision
+65,537, a follower at 65,535 needs only commit 65,536 plus the already loaded
+head's batch, instead of downloading the complete level-4 segment.
 
 The permanent metadata cost of copying a bounded frontier into each commit is
 linear in `N`, not quadratic. Actual byte cost should be benchmarked because a
 near-maximum 195-reference frontier can be tens of kilobytes per append.
+
+### Local measurements and capacity planning
+
+Reproduce the catch-up comparison and compaction resource measurements with:
+
+```sh
+go test . -run '^$' -bench '^BenchmarkCatchUp$' -benchtime=1x -benchmem
+go test . -run '^$' -bench '^BenchmarkStreamingCompaction$' -benchtime=1x -benchmem
+```
+
+These September 12, 2026 measurements used Go 1.27 on Linux/amd64, an Intel
+Xeon 6975P-C, and GOMAXPROCS=16. Each case ran once; timing and sampled peak heap
+are illustrative, not deployment guarantees. Fixture generation is outside
+the measured interval. Catch-up uses an in-memory Store and real scratch files;
+compaction uses a file-backed Store, with both source and scratch data eligible
+for the OS page cache. Neither benchmark includes S3 latency or throttling.
+
+The catch-up fixture has 65,537 two-integer batch records. Costs below exclude
+the head lookup. The packed baseline downloads and validates the whole level-4
+object even when it only needs a suffix:
+
+| New batches | Adaptive GETs | Adaptive bytes | Packed GETs | Packed bytes |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 0 | 0 | 0 | 0 |
+| 2 | 1 | 25,321 | 1 | 3,280,023 |
+| 3 | 2 | 50,294 | 1 | 3,280,023 |
+| 17 | 16 | 363,355 | 1 | 3,280,023 |
+| 257 | 31 | 377,906 | 1 | 3,280,023 |
+| 65,537 (full load) | 1 | 3,280,023 | 1 | 3,280,023 |
+
+Request savings are not the only goal: the 17- and 257-batch cases trade more
+requests for fewer bytes and less decoding. Small packed ranges remain useful.
+At a level-2 boundary with three new batches, the estimator keeps the single
+12,661-byte packed GET instead of two raw commits totaling 23,982 bytes.
+
+The level-4 compaction fixture contains 65,536 batches with 1,024-character
+strings: 64.25 MiB of batch JSON in total. Repeated payloads contain only `x`;
+random payloads encode deterministic random bytes as base64. Each writer reads
+the same sixteen complete level-3 segments and creates the same level-4 object.
+Two writers include the losing aggregate creation and its validation readback.
+These numbers measure the large compaction step preceding commit publication,
+excluding smaller carries, the final commit, and any conflict retry afterward.
+
+| Payload | Writers | Elapsed seconds | Approx. CPU seconds | Store read MiB | Store write MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Repeated | 1 | 0.74 | 2.12 | 2.89 | 2.90 |
+| Repeated | 2 | 1.72 | 5.93 | 8.68 | 5.80 |
+| Random | 1 | 1.02 | 2.54 | 51.94 | 51.94 |
+| Random | 2 | 2.11 | 6.87 | 155.82 | 103.88 |
+
+| Payload | Writers | Peak scratch MiB | Scratch writes MiB | Sampled extra heap MiB |
+| --- | ---: | ---: | ---: | ---: |
+| Repeated | 1 | 22.54 | 86.23 | 25.54 |
+| Repeated | 2 | 45.11 | 175.35 | 50.32 |
+| Random | 1 | 71.36 | 184.32 | 27.43 |
+| Random | 2 | 141.64 | 420.57 | 54.03 |
+
+CPU values use Go runtime CPU accounting, including GC and scavenging work.
+Scratch counters track bytes written and live file lengths, not filesystem
+allocation blocks. Peak heap is sampled every 5 ms; it excludes the Store's
+file contents and OS page cache. Total allocations remain substantial (about
+700 MiB for one level-4 writer here) despite much smaller live heap. Repeated
+writers duplicate decoding, compression, uploads, and scratch traffic.
+
+Budget scratch for the growing compressed output plus four expanded child
+spools and up to four compressed child downloads. With uneven child sizes,
+use the largest four children, not one quarter of the whole segment. Multiply
+that allowance by simultaneous appends. A scan needs its compressed download
+and validated record spool; an adaptive suffix also needs a spool for its
+selected records until their complete chain is checked. `Config.TempDir` can
+place this work on a volume separate from the system temporary directory.
+
+Compactions run synchronously before the next commit becomes visible. Every
+additional carry level covers sixteen times as many batches; ordinary append
+latency is therefore a poor basis for an append deadline. Measure the largest
+expected carry on the deployment's payloads, disk, and S3 connection. Allow for
+all carry levels, decoding and encoding, read and upload throughput, request
+latency, SDK retries, and contention. For example, this random level-4 case
+alone transfers about 104 MiB for one writer; a shared 10 MiB/s transfer budget
+already implies about ten seconds, before other work and retries. Multipart
+conflict retries can repeat an entire upload.
+
+Use context deadlines with that measured margin and arrange for failed
+operations to retry after the underlying resource issue is fixed. Disk-full,
+temporary-file creation, and close failures return errors without publishing
+the new commit; an already completed aggregate can remain for a retry to reuse.
+There is no aggregate admission cap or background compactor to hide this work.
+This fixture does not qualify multi-gigabyte carries or real S3 tail latency;
+those remain deployment qualification work. Byte/request counters can be
+collected with a Store wrapper, as these benchmarks demonstrate.
 
 ## 13. S3 adapter: IAM and bucket configuration
 

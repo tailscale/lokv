@@ -14,21 +14,32 @@ import (
 // tempFile is an append-only spool with independent readers. It is unlinked
 // immediately except on Windows, where Close removes it after closing the FD.
 type tempFile struct {
-	file *os.File
+	file tempHandle
 	size int64
-	name string // Nonempty while the file still has a directory entry.
+	name string // nonempty while the file still has a directory entry
+}
+
+// tempHandle permits fault injection and resource accounting in tests.
+type tempHandle interface {
+	io.ReaderAt
+	io.Writer
+	io.Closer
+	Name() string
 }
 
 func newTempFile() (*tempFile, error) {
-	f, err := os.CreateTemp("", "lokv-*")
+	return newTempFileIn("")
+}
+
+func newTempFileIn(dir string) (*tempFile, error) {
+	f, err := os.CreateTemp(dir, "lokv-*")
 	if err != nil {
 		return nil, err
 	}
 	tmp := &tempFile{file: f, name: f.Name()}
 	if runtime.GOOS != "windows" {
 		if err := os.Remove(tmp.name); err != nil {
-			tmp.Close()
-			return nil, err
+			return nil, errors.Join(err, tmp.Close())
 		}
 		tmp.name = ""
 	}
