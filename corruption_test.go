@@ -23,10 +23,10 @@ func TestCorruptCommit(t *testing.T) {
 	l := testLog[int](t, s)
 	snap := build(t, l, 17)
 	original := bytes.Clone(snap.body)
-	key := l.logKey(16)
+	key := l.logKey(17)
 	tests := map[string]func(map[string]any){
 		"format":                  func(c map[string]any) { c["format"] = "unknown" },
-		"revision":                func(c map[string]any) { c["revision"] = hexRevision(17) },
+		"revision":                func(c map[string]any) { c["revision"] = hexRevision(18) },
 		"revision uppercase":      func(c map[string]any) { c["revision"] = "000000000000001A" },
 		"commit ID":               func(c map[string]any) { c["commit_id"] = "abc" },
 		"event":                   func(c map[string]any) { c["event"] = 99 },
@@ -39,7 +39,7 @@ func TestCorruptCommit(t *testing.T) {
 		"frontier level missing":  func(c map[string]any) { delete(c["frontier"].([]any)[0].(map[string]any), "level") },
 		"wrong reference level":   func(c map[string]any) { refMap(c)["level"] = 2 },
 		"foreign key":             func(c map[string]any) { refMap(c)["key"] = "https://example.org/stolen" },
-		"range":                   func(c map[string]any) { refMap(c)["start"] = hexRevision(1) },
+		"range":                   func(c map[string]any) { refMap(c)["start"] = hexRevision(2) },
 		"boundary":                func(c map[string]any) { refMap(c)["last_record_hash"] = zeroHash },
 		"reference missing field": func(c map[string]any) { delete(refMap(c), "sha256") },
 	}
@@ -130,11 +130,11 @@ func TestAggregateValidation(t *testing.T) {
 	}
 	for name, mutate := range map[string]func(*segment){
 		"format": func(s *segment) { s.Format = "bad" }, "level": func(s *segment) { s.Level = 2 }, "count": func(s *segment) { s.Records = s.Records[:15] },
-		"range": func(s *segment) { s.End = hexRevision(16) }, "record hash": func(s *segment) { s.Records[3].RecordHash = zeroHash },
+		"range": func(s *segment) { s.End = hexRevision(17) }, "record hash": func(s *segment) { s.Records[3].RecordHash = zeroHash },
 		"chain": func(s *segment) {
 			p := &s.Records[3]
 			p.PreviousRecordHash = zeroHash
-			p.RecordHash = recordHash(3, p.CommitID, zeroHash, p.Event)
+			p.RecordHash = recordHash(4, p.CommitID, zeroHash, p.Event)
 		},
 		"order": func(s *segment) { s.Records[3], s.Records[4] = s.Records[4], s.Records[3] },
 	} {
@@ -228,12 +228,44 @@ func TestDecompressionLimits(t *testing.T) {
 
 func TestFullWidthFrontier(t *testing.T) {
 	l := testLog[int](t, newStore())
+	frontier := syntheticFrontier(l, math.MaxInt64)
+	var count int
+	for _, f := range frontier {
+		count += len(f.Refs)
+	}
+	if count != 231 {
+		t.Fatalf("maximum frontier has %d references", count)
+	}
+	if err := l.validateFrontier(frontier, math.MaxInt64, zeroHash); err != nil {
+		t.Fatal(err)
+	}
+	reverse := append([]frontierLevel(nil), frontier...)
+	reverse[0], reverse[1] = reverse[1], reverse[0]
+	if err := l.validateFrontier(reverse, math.MaxInt64, zeroHash); !errors.Is(err, ErrCorrupt) {
+		t.Fatal(err)
+	}
+	bad := frontier[15].Refs[0]
+	bad.Start = hexRevision(math.MaxInt64)
+	bad.End = hexRevision(math.MaxInt64)
+	if _, _, err := l.validateRef(bad); !errors.Is(err, ErrCorrupt) {
+		t.Fatal(err)
+	}
+	// This aligned block would end at MaxInt64+1. Reject before adding its size.
+	bad.Start = hexRevision(math.MaxInt64 - (1 << 60) + 2)
+	if _, _, err := l.validateRef(bad); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("overflowing aligned range: %v", err)
+	}
+}
+
+// syntheticFrontier builds metadata for boundary tests without storing the
+// referenced history. Tests only fetch the real records appended after this root.
+func syntheticFrontier(l *Log[int], revision int64) []frontierLevel {
 	var levels [16][]objectRef
-	next := uint64(0)
+	next := int64(1)
 	for level := 15; level >= 0; level-- {
-		size := uint64(1) << (4 * level)
-		for i := 0; i < 15; i++ {
-			ref := objectRef{uint8(level), hexRevision(next), hexRevision(next + size - 1), "", zeroHash, zeroHash, zeroHash}
+		size := int64(1) << (4 * level)
+		for i := int64(0); i < ((revision-1)>>(4*level))&15; i++ {
+			ref := objectRef{uint8(level), hexRevision(next), hexRevision(next + (size - 1)), "", zeroHash, zeroHash, zeroHash}
 			if level == 0 {
 				ref.Key = l.logKey(next)
 			} else {
@@ -245,25 +277,11 @@ func TestFullWidthFrontier(t *testing.T) {
 	}
 	var frontier []frontierLevel
 	for level, refs := range levels {
-		frontier = append(frontier, frontierLevel{uint8(level), refs})
+		if len(refs) != 0 {
+			frontier = append(frontier, frontierLevel{uint8(level), refs})
+		}
 	}
-	if next != math.MaxUint64 {
-		t.Fatal(next)
-	}
-	if err := l.validateFrontier(frontier, math.MaxUint64, zeroHash); err != nil {
-		t.Fatal(err)
-	}
-	reverse := append([]frontierLevel(nil), frontier...)
-	reverse[0], reverse[1] = reverse[1], reverse[0]
-	if err := l.validateFrontier(reverse, math.MaxUint64, zeroHash); !errors.Is(err, ErrCorrupt) {
-		t.Fatal(err)
-	}
-	bad := frontier[15].Refs[0]
-	bad.Start = hexRevision(math.MaxUint64)
-	bad.End = hexRevision(math.MaxUint64)
-	if _, _, err := l.validateRef(bad); !errors.Is(err, ErrCorrupt) {
-		t.Fatal(err)
-	}
+	return frontier
 }
 
 type blockingGetStore struct {
@@ -345,8 +363,8 @@ func TestSnapshotValueMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = l.Scan(context.Background(), next, Range{0, 1}, func(r Record[map[string]int]) error {
-		if r.Value["x"] != int(r.Revision+1) {
+	err = l.Scan(context.Background(), next, Range{1, 2}, func(r Record[map[string]int]) error {
+		if r.Value["x"] != int(r.Revision) {
 			t.Fatal("snapshot mutation changed wire data")
 		}
 		return nil
@@ -363,7 +381,7 @@ func TestRequiredGenesisFields(t *testing.T) {
 		body := strings.Replace(string(s.body), part, "", 1)
 		// Removing the final field needs its preceding comma removed as well.
 		body = strings.Replace(body, ",}", "}", 1)
-		if _, err := l.decodeCommit(l.logKey(0), []byte(body)); !errors.Is(err, ErrCorrupt) {
+		if _, err := l.decodeCommit(l.logKey(1), []byte(body)); !errors.Is(err, ErrCorrupt) {
 			t.Fatal(err)
 		}
 	}
@@ -392,20 +410,20 @@ func TestEventBytesAndCaseAliases(t *testing.T) {
 	for _, event := range []json.RawMessage{json.RawMessage(`"<"`), json.RawMessage(`{ "x": 1 }`)} {
 		c := *s.commit
 		c.Event = event
-		c.RecordHash = recordHash(0, c.CommitID, zeroHash, c.Event)
+		c.RecordHash = recordHash(1, c.CommitID, zeroHash, c.Event)
 		// Build the noncanonical envelope without RawMessage marshaling normalizing it.
 		b := bytes.Replace(s.body, []byte(`"safe"`), event, 1)
 		b = bytes.Replace(b, []byte(s.commit.RecordHash), []byte(c.RecordHash), 1)
-		if _, err := l.decodeCommit(l.logKey(0), b); !errors.Is(err, ErrCorrupt) {
+		if _, err := l.decodeCommit(l.logKey(1), b); !errors.Is(err, ErrCorrupt) {
 			t.Fatal(err)
 		}
 	}
 	b := append([]byte(`{"Format":"lokv/commit/v1",`), s.body[1:]...)
-	if _, err := l.decodeCommit(l.logKey(0), b); !errors.Is(err, ErrCorrupt) {
+	if _, err := l.decodeCommit(l.logKey(1), b); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
 	b = append([]byte(`{"future_field":{"any":"value"},`), s.body[1:]...)
-	if _, err := l.decodeCommit(l.logKey(0), b); err != nil {
+	if _, err := l.decodeCommit(l.logKey(1), b); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -431,7 +449,7 @@ func TestAggregateEventLimit(t *testing.T) {
 		t.Fatal("oversized segment was uploaded")
 	}
 	head, err := l.LoadHead(context.Background())
-	if err != nil || head.Revision() != 15 {
+	if err != nil || head.Revision() != 16 {
 		t.Fatal(err)
 	}
 }

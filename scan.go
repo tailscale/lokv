@@ -9,8 +9,9 @@ import (
 	"fmt"
 )
 
-// Range is an inclusive interval of revisions within a snapshot.
-type Range struct{ First, Last uint64 }
+// Range is an inclusive interval of revisions within a snapshot. Revisions start
+// at 1; First and Last must both be positive, with First <= Last.
+type Range struct{ First, Last int64 }
 
 // Scan visits exactly the requested revisions in increasing order and stops
 // immediately on callback error. It validates each fetched object, including
@@ -23,7 +24,7 @@ func (l *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield fun
 	if err := l.checkSnapshot(snap); err != nil {
 		return err
 	}
-	if snap == nil || r.First > r.Last || r.Last > snap.Revision() {
+	if snap == nil || r.First <= 0 || r.Last <= 0 || r.First > r.Last || r.Last > snap.Revision() {
 		return ErrRange
 	}
 	if yield == nil {
@@ -137,5 +138,5 @@ func (l *Log[T]) Verify(ctx context.Context, snap *Snapshot[T]) error {
 	if snap == nil {
 		return nil
 	}
-	return l.Scan(ctx, snap, Range{0, snap.Revision()}, func(Record[T]) error { return nil })
+	return l.Scan(ctx, snap, Range{1, snap.Revision()}, func(Record[T]) error { return nil })
 }

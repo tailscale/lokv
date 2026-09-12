@@ -51,12 +51,12 @@ func TestLiveS3(t *testing.T) {
 	}
 	for i := 0; i < 17; i++ {
 		r, err := l.Append(ctx, i)
-		if err != nil || r.Revision != uint64(i) {
+		if err != nil || r.Revision != int64(i+1) {
 			t.Fatalf("append %d: %v", i, err)
 		}
 	}
 	keys, err := store.List(ctx, prefix+"log/v1/log/", 1)
-	if err != nil || len(keys) != 1 || keys[0] != prefix+"log/v1/log/ffffffffffffffef.json" {
+	if err != nil || len(keys) != 1 || keys[0] != prefix+"log/v1/log/7fffffffffffffee.json" {
 		t.Fatalf("one-key LIST: %v %v", keys, err)
 	}
 	if err := store.Create(ctx, keys[0], []byte("overwrite")); !errors.Is(err, lokv.ErrExists) {

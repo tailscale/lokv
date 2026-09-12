@@ -90,7 +90,8 @@ type RecordHash [32]byte
 
 // Record is a decoded log event and its identity.
 type Record[T any] struct {
-	Revision   uint64
+	// Revision is the record's sequence number, starting at 1. Values <= 0 are invalid.
+	Revision   int64
 	CommitID   CommitID
 	Value      T
 	RecordHash RecordHash
@@ -125,9 +126,9 @@ func (s *Snapshot[T]) Record() Record[T] {
 	return s.record
 }
 
-// Revision returns the root's revision. It returns zero for an empty snapshot;
-// use Empty to distinguish an empty log from revision zero.
-func (s *Snapshot[T]) Revision() uint64 {
+// Revision returns the root's positive revision, starting at 1. It returns zero
+// for an empty snapshot; zero is never a valid record revision.
+func (s *Snapshot[T]) Revision() int64 {
 	if s == nil {
 		return 0
 	}
@@ -135,7 +136,7 @@ func (s *Snapshot[T]) Revision() uint64 {
 }
 
 // Empty reports whether the snapshot represents an empty log.
-func (s *Snapshot[T]) Empty() bool { return s == nil }
+func (s *Snapshot[T]) Empty() (empty bool) { return s == nil }
 
 func (l *Log[T]) record(p projection) (Record[T], error) {
 	var r Record[T]
@@ -169,6 +170,9 @@ func (l *Log[T]) snapshot(key string, body []byte) (*Snapshot[T], error) {
 func (l *Log[T]) checkSnapshot(s *Snapshot[T]) error {
 	if s != nil && (s.owner != l || s.commit == nil) {
 		return errors.New("lokv: snapshot belongs to a different log or is uninitialized")
+	}
+	if s != nil && s.Revision() <= 0 {
+		return corrupt("snapshot revision must be positive")
 	}
 	return nil
 }
@@ -218,7 +222,14 @@ func (l *Log[T]) LoadHead(ctx context.Context) (*Snapshot[T], error) {
 
 // LoadRevision loads a historical root without listing. An absent requested
 // revision returns ErrNotFound; missing dependencies encountered later are corrupt.
-func (l *Log[T]) LoadRevision(ctx context.Context, revision uint64) (*Snapshot[T], error) {
+// Revisions start at 1; a revision <= 0 returns ErrRange without store I/O.
+func (l *Log[T]) LoadRevision(ctx context.Context, revision int64) (*Snapshot[T], error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if revision <= 0 {
+		return nil, ErrRange
+	}
 	key := l.logKey(revision)
 	b, err := l.get(ctx, key, false)
 	if err != nil {
@@ -227,8 +238,9 @@ func (l *Log[T]) LoadRevision(ctx context.Context, revision uint64) (*Snapshot[T
 	return l.snapshot(key, b)
 }
 
-// Head returns the latest event, or (zero, false, nil) for an empty log.
-func (l *Log[T]) Head(ctx context.Context) (Record[T], bool, error) {
+// Head returns the latest event. ok reports whether a record was returned.
+// An empty log returns (zero, false, nil).
+func (l *Log[T]) Head(ctx context.Context) (_ Record[T], ok bool, _ error) {
 	s, err := l.LoadHead(ctx)
 	if err != nil || s == nil {
 		return Record[T]{}, false, err
@@ -252,6 +264,7 @@ func (l *Log[T]) prepare(value T) (json.RawMessage, string, error) {
 }
 
 // Append marshals once and retries optimistic conflicts with the same commit ID.
+// The first record has revision 1. Appending after math.MaxInt64 returns ErrExhausted.
 // Transport retries belong to the adapter. An unresolved transport error is
 // returned, since the core cannot classify arbitrary backend errors as retryable.
 func (l *Log[T]) Append(ctx context.Context, value T) (Record[T], error) {
@@ -277,8 +290,13 @@ func (l *Log[T]) Append(ctx context.Context, value T) (Record[T], error) {
 	}
 }
 
-// AppendTo attempts exactly one successor of base. Nil means the empty root.
-// It does not list, and returns ErrConflict when another writer wins.
+// AppendTo attempts exactly one successor of base. A nil base means the empty
+// root, whose successor has revision 1. It does not list, and returns ErrConflict
+// when another writer wins or ErrExhausted when base is already at math.MaxInt64.
+//
+// Use AppendTo when the value depends on a snapshot you read: a conflict lets you
+// reload and recompute it. Append retries the same value automatically. Reusing
+// a snapshot also saves the head lookup required by Append.
 func (l *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value T) (*Snapshot[T], error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -286,7 +304,7 @@ func (l *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value T) (*Sna
 	if err := l.checkSnapshot(base); err != nil {
 		return nil, err
 	}
-	if base != nil && base.Revision() == math.MaxUint64 {
+	if base != nil && base.Revision() == math.MaxInt64 {
 		return nil, ErrExhausted
 	}
 	event, id, err := l.prepare(value)
@@ -297,11 +315,14 @@ func (l *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value T) (*Sna
 }
 
 func (l *Log[T]) appendPrepared(ctx context.Context, base *Snapshot[T], event json.RawMessage, id string) (*Snapshot[T], error) {
-	var revision uint64
+	if err := l.checkSnapshot(base); err != nil {
+		return nil, err
+	}
+	revision := int64(1)
 	var prev *previous
 	frontier := make([]frontierLevel, 0)
 	if base != nil {
-		if base.Revision() == math.MaxUint64 {
+		if base.Revision() == math.MaxInt64 {
 			return nil, ErrExhausted
 		}
 		revision = base.Revision() + 1

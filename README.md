@@ -9,8 +9,9 @@ SPDX-License-Identifier: BSD-3-Clause
 # lokv (Log over K/V)
 
 lokv implements an append-only log over a sorted, create-only key/value store
-(e.g. S3, if so configured). Values are JSON, revisions are gap-free `uint64`s,
-and every commit is a historical snapshot.
+(e.g. S3, if so configured). Values are JSON, revisions are gap-free `int64`s
+starting at **1**, and every commit is a historical snapshot. Nonpositive revisions
+are invalid.
 
 ```go
 import (
@@ -28,13 +29,13 @@ log, err := lokv.Open[string](lokv.Config{
 })
 if err != nil { return err }
 
-record, err := log.Append(ctx, "created") // revision 0
+record, err := log.Append(ctx, "created") // revision 1
 if err != nil { return err }
 fmt.Println(record.Revision)
 
 snap, err := log.LoadHead(ctx)
 if err != nil { return err }
-err = log.Scan(ctx, snap, lokv.Range{First: 0, Last: snap.Revision()},
+err = log.Scan(ctx, snap, lokv.Range{First: 1, Last: snap.Revision()},
     func(r lokv.Record[string]) error {
         fmt.Println(r.Revision, r.Value)
         return nil
@@ -43,12 +44,17 @@ if err != nil { return err }
 ```
 
 `Head` returns `(record, found, error)`. `LoadHead` returns a nil snapshot for an
-empty log. `LoadRevision` loads a historical snapshot without listing.
+empty log. An empty snapshot reports revision 0, which is not a valid record
+revision. `LoadRevision` loads a historical snapshot without listing and rejects
+revisions <= 0 with `ErrRange`. Appending after `math.MaxInt64` returns `ErrExhausted`.
 `AppendTo(ctx, snapshot, value)` avoids head discovery and attempts one successor;
-a stale snapshot returns `ErrConflict`. Snapshots belong to the `Log` that loaded
-them. Their private wire state is unaffected by mutations to returned values.
+a stale snapshot returns `ErrConflict`. Use it when choosing the next event depends
+on the history you just read, so you can reload and recompute on conflict.
+`Append` retries the same value automatically. Snapshots belong to the `Log` that
+loaded them. Their private wire state is unaffected by mutations to returned values.
 
-Ranges include both endpoints and must fit inside a nonempty snapshot. `Scan`
+Ranges include both endpoints, must be positive, and must fit inside a nonempty
+snapshot; invalid ranges return `ErrRange`. `Scan`
 visits records in order and returns callback errors immediately. `Verify` scans
 all records and reachable tree objects; verifying an empty snapshot succeeds.
 Loading validates the root locally, while scans validate the objects they fetch.
@@ -60,8 +66,8 @@ There is no mutable HEAD. Reverse revision keys make one ascending `List` with
 limit 1 find the newest commit. A head read uses that LIST and one GET.
 
 A radix-16 frontier packs every completed group of 16 preceding events into one
-zstd segment. Higher levels contain references only. Appending revision 16
-creates a segment and a commit; revision 256 creates a segment, an index, and a
+zstd segment. Higher levels contain references only. Appending revision 17
+creates a segment and a commit; revision 257 creates a segment, an index, and a
 commit. An ordinary append creates only its commit. For `N` records, successful
 single-writer creations total:
 
@@ -156,7 +162,7 @@ go vet ./...
 go test -run '^$' -bench . -benchmem
 ```
 
-Tests cover carry boundaries through revision 4096, request counts, concurrent
+Tests cover carry boundaries through revision 4097, request counts, concurrent
 writers, crash injection, ambiguous success, corruption, pruning, and resource
 limits. HTTP tests exercise the actual AWS SDK request headers and status mapping.
 Benchmarks report store requests and average carry depth alongside allocations.

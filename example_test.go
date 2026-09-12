@@ -24,7 +24,7 @@ func Example() {
 			panic(err)
 		}
 	}
-	err = log.Scan(ctx, snapshot, lokv.Range{First: 0, Last: snapshot.Revision()}, func(record lokv.Record[string]) error {
+	err = log.Scan(ctx, snapshot, lokv.Range{First: 1, Last: snapshot.Revision()}, func(record lokv.Record[string]) error {
 		fmt.Println(record.Revision, record.Value)
 		return nil
 	})
@@ -32,7 +32,7 @@ func Example() {
 		panic(err)
 	}
 	// Output:
-	// 0 created
-	// 1 updated
-	// 2 archived
+	// 1 created
+	// 2 updated
+	// 3 archived
 }

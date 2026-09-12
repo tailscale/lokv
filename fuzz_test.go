@@ -9,7 +9,7 @@ import (
 )
 
 func FuzzKeyParsing(f *testing.F) {
-	for _, s := range []string{"v1/log/ffffffffffffffff.json", "v1/log/0000000000000000.json", "", "v1/log/FFFFFFFFFFFFFFFF.json"} {
+	for _, s := range []string{"v1/log/7ffffffffffffffe.json", "v1/log/7fffffffffffffff.json", "v1/log/0000000000000000.json", "", "v1/log/FFFFFFFFFFFFFFFF.json"} {
 		f.Add(s)
 	}
 	l := testLog[int](f, newStore())
@@ -31,15 +31,17 @@ func FuzzCommitDecoding(f *testing.F) {
 		if len(b) > 1<<20 {
 			return
 		}
-		_, _ = l.decodeCommit(l.logKey(0), b)
+		_, _ = l.decodeCommit(l.logKey(1), b)
 	})
 }
 
 func FuzzFrontier(f *testing.F) {
-	f.Add(uint64(0), []byte("[]"))
-	f.Add(uint64(16), []byte(`[ {"level":1,"refs":[]} ]`))
+	f.Add(int64(-1), []byte("[]"))
+	f.Add(int64(0), []byte("[]"))
+	f.Add(int64(1), []byte("[]"))
+	f.Add(int64(17), []byte(`[ {"level":1,"refs":[]} ]`))
 	l := testLog[int](f, newStore())
-	f.Fuzz(func(t *testing.T, revision uint64, b []byte) {
+	f.Fuzz(func(t *testing.T, revision int64, b []byte) {
 		if len(b) > 1<<20 {
 			return
 		}
@@ -51,13 +53,13 @@ func FuzzFrontier(f *testing.F) {
 }
 
 func FuzzIndexDecoding(f *testing.F) {
-	f.Add([]byte(`{"format":"lokv/index/v1","level":2,"start":"0000000000000000","end":"00000000000000ff","children":[]}`))
+	f.Add([]byte(`{"format":"lokv/index/v1","level":2,"start":"0000000000000001","end":"0000000000000100","children":[]}`))
 	l := testLog[int](f, newStore())
 	f.Fuzz(func(t *testing.T, b []byte) {
 		if len(b) > 1<<20 {
 			return
 		}
-		ref := objectRef{2, hexRevision(0), hexRevision(255), "", digest(b), zeroHash, zeroHash}
+		ref := objectRef{2, hexRevision(1), hexRevision(256), "", digest(b), zeroHash, zeroHash}
 		ref.Key = l.treeKey(ref)
 		_, _ = l.decodeIndex(ref, b)
 	})

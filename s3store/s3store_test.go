@@ -162,7 +162,7 @@ func TestHTTPHeadAndCarries(t *testing.T) {
 		}
 	}
 	snap, err := l.LoadHead(context.Background())
-	if err != nil || snap.Revision() != 16 {
+	if err != nil || snap.Revision() != 17 {
 		t.Fatalf("head: %v", err)
 	}
 	if err := l.Verify(context.Background(), snap); err != nil {

@@ -8,16 +8,28 @@ import (
 	"errors"
 )
 
-// Store is an immutable flat namespace. Implementations must be safe for
-// concurrent use and obey the consistency contract in the package documentation.
+// Store is a sorted, create-only key/value namespace. Implementations must be
+// safe for concurrent use and honor context cancellation.
+//
+// Create must atomically publish a complete value only if the key is absent,
+// with exactly one winner among concurrent creators. Successful creation must
+// be immediately visible to both Get and List. List must return globally
+// ascending bytewise keys for the requested prefix and honor its result limit.
 // Returned buffers belong to the caller; Create must not retain a mutable input.
+//
+// Values are immutable. The storage authority must prohibit overwrites,
+// deletion, and lifecycle expiration. Open cannot verify these operational
+// preconditions. The s3store subpackage adapts general-purpose S3 buckets;
+// directory buckets are unsupported because their listing is unordered.
 type Store interface {
 	// List returns at most limit matching keys in ascending bytewise order.
 	// limit must be positive. A successful Create is immediately visible to List.
 	List(ctx context.Context, prefix string, limit int) ([]string, error)
+
 	// Get returns the complete object, or an error matching ErrNotFound.
 	// Adapters must bound response bodies before allocating them in memory.
 	Get(ctx context.Context, key string) ([]byte, error)
+
 	// Create atomically publishes a complete value only if key is absent.
 	// Exactly one concurrent creator wins; losers return ErrExists after the
 	// winner is visible. Create must never overwrite an existing value.

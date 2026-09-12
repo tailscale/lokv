@@ -36,7 +36,7 @@ func BenchmarkScan(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := l.Scan(context.Background(), snap, Range{0, 4096}, func(Record[int]) error { return nil }); err != nil {
+		if err := l.Scan(context.Background(), snap, Range{1, 4097}, func(Record[int]) error { return nil }); err != nil {
 			b.Fatal(err)
 		}
 	}

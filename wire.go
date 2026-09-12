@@ -71,9 +71,9 @@ type indexNode struct {
 	Children []objectRef `json:"children"`
 }
 
-func hexRevision(r uint64) string { return fmt.Sprintf("%016x", r) }
+func hexRevision(r int64) string { return fmt.Sprintf("%016x", r) }
 
-func validHex(s string, n int) bool {
+func validHex(s string, n int) (valid bool) {
 	if len(s) != n {
 		return false
 	}
@@ -85,11 +85,26 @@ func validHex(s string, n int) bool {
 	return true
 }
 
-func parseRevision(s string) (uint64, error) {
+// parseHexInt64 also accepts zero, which is a valid reverse-encoded key suffix.
+func parseHexInt64(s string) (int64, error) {
 	if !validHex(s, 16) {
 		return 0, corrupt("invalid revision")
 	}
-	r, _ := strconv.ParseUint(s, 16, 64)
+	r, err := strconv.ParseInt(s, 16, 64)
+	if err != nil {
+		return 0, corrupt("revision exceeds int64 range")
+	}
+	return r, nil
+}
+
+func parseRevision(s string) (int64, error) {
+	r, err := parseHexInt64(s)
+	if err != nil {
+		return 0, err
+	}
+	if r <= 0 {
+		return 0, corrupt("revision must be positive")
+	}
 	return r, nil
 }
 
@@ -97,11 +112,12 @@ func corrupt(message string) error  { return fmt.Errorf("%w: %s", ErrCorrupt, me
 func digest(b []byte) string        { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 func (l *Log[T]) logPrefix() string { return l.prefix + "v1/log/" }
 
-func (l *Log[T]) logKey(r uint64) string {
-	return l.logPrefix() + hexRevision(math.MaxUint64-r) + ".json"
+// logKey requires a positive revision, checked by callers before encoding.
+func (l *Log[T]) logKey(r int64) string {
+	return l.logPrefix() + hexRevision(math.MaxInt64-r) + ".json"
 }
 
-func (l *Log[T]) parseLogKey(key string) (uint64, error) {
+func (l *Log[T]) parseLogKey(key string) (int64, error) {
 	if !strings.HasPrefix(key, l.logPrefix()) {
 		return 0, corrupt("foreign commit key")
 	}
@@ -109,8 +125,14 @@ func (l *Log[T]) parseLogKey(key string) (uint64, error) {
 	if len(s) != 21 || !strings.HasSuffix(s, ".json") {
 		return 0, corrupt("invalid commit key")
 	}
-	r, err := parseRevision(s[:16])
-	return math.MaxUint64 - r, err
+	r, err := parseHexInt64(s[:16])
+	if err != nil {
+		return 0, err
+	}
+	if r == math.MaxInt64 {
+		return 0, corrupt("commit key encodes revision zero")
+	}
+	return math.MaxInt64 - r, nil
 }
 
 func (l *Log[T]) treeKey(ref objectRef) string {
@@ -121,11 +143,11 @@ func (l *Log[T]) treeKey(ref objectRef) string {
 	return fmt.Sprintf("%sv1/tree/%x/%s-%s-%s%s", l.prefix, ref.Level, ref.Start, ref.End, ref.SHA256, suffix)
 }
 
-func recordHash(r uint64, id, prev string, event []byte) string {
+func recordHash(r int64, id, prev string, event []byte) string {
 	h := sha256.New()
 	h.Write([]byte("lokv-record-v1\x00"))
 	var n [8]byte
-	binary.BigEndian.PutUint64(n[:], r)
+	binary.BigEndian.PutUint64(n[:], uint64(r))
 	h.Write(n[:])
 	b, _ := hex.DecodeString(id)
 	h.Write(b)
@@ -238,7 +260,7 @@ func requiredFields(b []byte, t reflect.Type) error {
 	return nil
 }
 
-func (l *Log[T]) validateProjection(p projection) (uint64, error) {
+func (l *Log[T]) validateProjection(p projection) (int64, error) {
 	r, err := parseRevision(p.Revision)
 	if err != nil {
 		return 0, err
@@ -246,7 +268,7 @@ func (l *Log[T]) validateProjection(p projection) (uint64, error) {
 	if !validHex(p.CommitID, 32) || !validHex(p.PreviousRecordHash, 64) || !validHex(p.RecordHash, 64) {
 		return 0, corrupt("invalid record hash or ID")
 	}
-	if r == 0 && p.PreviousRecordHash != zeroHash {
+	if r == 1 && p.PreviousRecordHash != zeroHash {
 		return 0, corrupt("invalid genesis hash")
 	}
 	if int64(len(p.Event)) > l.maxEvent {
@@ -265,7 +287,7 @@ func (l *Log[T]) validateProjection(p projection) (uint64, error) {
 	return r, nil
 }
 
-func (l *Log[T]) validateRef(ref objectRef) (uint64, uint64, error) {
+func (l *Log[T]) validateRef(ref objectRef) (int64, int64, error) {
 	if ref.Level > 15 {
 		return 0, 0, corrupt("invalid reference level")
 	}
@@ -277,8 +299,8 @@ func (l *Log[T]) validateRef(ref objectRef) (uint64, uint64, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	size := uint64(1) << (4 * ref.Level)
-	if start%size != 0 || start > math.MaxUint64-(size-1) || end != start+size-1 {
+	size := int64(1) << (4 * ref.Level)
+	if (start-1)%size != 0 || start > math.MaxInt64-(size-1) || end != start+(size-1) {
 		return 0, 0, corrupt("invalid reference range")
 	}
 	if !validHex(ref.SHA256, 64) || !validHex(ref.FirstPrevHash, 64) || !validHex(ref.LastRecordHash, 64) {
@@ -294,7 +316,10 @@ func (l *Log[T]) validateRef(ref objectRef) (uint64, uint64, error) {
 	return start, end, nil
 }
 
-func (l *Log[T]) validateFrontier(frontier []frontierLevel, revision uint64, prevHash string) error {
+func (l *Log[T]) validateFrontier(frontier []frontierLevel, revision int64, prevHash string) error {
+	if revision <= 0 {
+		return corrupt("revision must be positive")
+	}
 	var levels [16][]objectRef
 	last := -1
 	for _, f := range frontier {
@@ -304,10 +329,10 @@ func (l *Log[T]) validateFrontier(frontier []frontierLevel, revision uint64, pre
 		last = int(f.Level)
 		levels[f.Level] = f.Refs
 	}
-	next, chain := uint64(0), zeroHash
+	next, chain := int64(1), zeroHash
 	for level := 15; level >= 0; level-- {
 		refs := levels[level]
-		if len(refs) != int((revision>>(4*level))&15) {
+		if len(refs) != int(((revision-1)>>(4*level))&15) {
 			return corrupt("frontier digit mismatch")
 		}
 		for _, ref := range refs {
@@ -342,7 +367,7 @@ func (l *Log[T]) decodeCommit(key string, body []byte) (*commit, error) {
 	if c.Format != commitFormat || c.Revision != hexRevision(r) {
 		return nil, corrupt("commit format or revision mismatch")
 	}
-	if r == 0 {
+	if r == 1 {
 		if c.Previous != nil {
 			return nil, corrupt("genesis has predecessor")
 		}

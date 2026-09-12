@@ -79,6 +79,9 @@ func (l *Log[T]) validateChildren(ref objectRef, children []objectRef) error {
 				return corrupt("index end mismatch")
 			}
 		} else {
+			if ce == end {
+				return corrupt("index ends before its last child")
+			}
 			next = ce + 1
 		}
 	}
@@ -303,7 +306,7 @@ func (l *Log[T]) validateSegment(ref objectRef, seg *segment) error {
 		if err != nil {
 			return err
 		}
-		if revision != start+uint64(i) || p.PreviousRecordHash != chain {
+		if revision != start+int64(i) || p.PreviousRecordHash != chain {
 			return corrupt("segment adjacency mismatch")
 		}
 		chain = p.RecordHash

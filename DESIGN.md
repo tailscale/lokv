@@ -23,9 +23,9 @@ that revision. There is no mutable `HEAD` object. The current head is found with
 one forward `Store.List` request over reverse-encoded, fixed-width revision keys:
 
 ```text
-v1/log/fffffffffffffffd.json   # revision 2
-v1/log/fffffffffffffffe.json   # revision 1
-v1/log/ffffffffffffffff.json   # revision 0
+v1/log/7ffffffffffffffc.json   # revision 3
+v1/log/7ffffffffffffffd.json   # revision 2
+v1/log/7ffffffffffffffe.json   # revision 1
 ```
 
 Ascending lexical order therefore returns the highest revision first.
@@ -55,7 +55,7 @@ overwritten or deleted by this library.
 
 1. Store an arbitrary Go value `T` for which `json.Marshal` and `json.Unmarshal`
    work.
-2. Give committed records a gap-free, zero-based `uint64` revision.
+2. Give committed records a gap-free `int64` revision starting at 1.
 3. Find the latest committed revision with one `LIST` returning at most one key.
 4. Use one object creation for an append that causes no radix carry.
 5. Avoid repeatedly rewriting all historical event bytes.
@@ -86,7 +86,8 @@ overwritten or deleted by this library.
 ## 4. Terminology and invariants
 
 `revision`
-: Zero-based sequence number. Revision 0 is the first record.
+: Positive `int64` sequence number. Revision 1 is the first record; revisions
+  <= 0 are invalid. Zero is reserved for empty-snapshot accessors.
 
 `commit`
 : The immutable `v1/log/...json` object containing one event and the radix
@@ -96,7 +97,7 @@ overwritten or deleted by this library.
 : The committed object with the greatest revision, found by reverse-key listing.
 
 `frontier`
-: A canonical partition of revisions `[0, head.revision)` into ordered blocks.
+: A canonical partition of revisions `[1, head.revision)` into ordered blocks.
 
 `reference`
 : A key, content digest, level, and inclusive revision range naming a commit,
@@ -104,24 +105,24 @@ overwritten or deleted by this library.
 
 Required invariants:
 
-1. The log is empty, or committed revision keys are exactly `0..HEAD`.
-2. A commit at revision `R > 0` names revision `R-1` as its predecessor.
-3. A commit's frontier covers exactly `[0,R)` with no gaps or overlap.
+1. The log is empty, or committed revision keys are exactly `1..HEAD`.
+2. A commit at revision `R > 1` names revision `R-1` as its predecessor.
+3. A commit's frontier covers exactly `[1,R)` with no gaps or overlap.
 4. A level `L` reference covers exactly `16^L` consecutive records and its
-   start revision is aligned to `16^L`.
+   start revision minus 1 is aligned to `16^L`: `(start-1) % 16^L == 0`.
 5. At most 15 references exist at any frontier level.
 6. Frontier references are chronological within a level. When the whole
    frontier is read, levels are visited from highest to lowest.
-7. `len(frontier[L])` equals nibble `L` of `R`.
+7. `len(frontier[L])` equals nibble `L` of `R-1`, the number of preceding records.
 8. Every referenced object exists and matches the key, range, level, and digest
    in its reference.
 9. Aggregate objects are successfully created before a commit that references
    them is created.
 10. The commit creation is conditional and is the append's linearization point.
 
-For a `uint64` revision there are 16 frontier levels, numbered 0 through 15.
-The maximum frontier contains 240 references. This bounds commit metadata even
-though old commit objects are retained forever.
+For an `int64` revision there are 16 frontier levels, numbered 0 through 15.
+Level 15 has at most 7 references, and the maximum frontier contains 231 references.
+This bounds commit metadata even though old commit objects are retained forever.
 
 ## 5. Store interface and required behavior
 
@@ -215,7 +216,7 @@ prefix is allowed. All package-owned objects live under `<prefix>/v1/`.
 
 Rules:
 
-- `reverseRevision = math.MaxUint64 - revision`, formatted as exactly 16
+- `reverseRevision = math.MaxInt64 - revision`, formatted as exactly 16
   lowercase hexadecimal digits.
 - `start` and `end` are inclusive revisions, also exactly 16 lowercase hex
   digits.
@@ -236,9 +237,11 @@ keys, err := store.List(ctx, "<prefix>/v1/log/", 1)
 The S3 adapter implements that call with `ListObjectsV2`, `MaxKeys=1`, and no
 delimiter.
 
-An empty result means an empty log. Otherwise the sole key must exactly match
-the commit-key grammar. Decode and invert its suffix to obtain the candidate
-revision, GET it, and validate that the envelope revision agrees with the key.
+Valid commit revisions range from 1 through `math.MaxInt64`; a reverse suffix
+encoding revision 0 is corrupt. An empty result means an empty log. Otherwise the
+sole key must exactly match the commit-key grammar. Decode and invert its suffix
+to obtain the candidate revision, GET it, and validate that the envelope revision
+agrees with the key.
 Malformed first results are corruption and must not be skipped.
 
 ## 7. Wire model
@@ -254,10 +257,10 @@ characters.
 ```json
 {
   "format": "lokv/commit/v1",
-  "revision": "0000000000000010",
+  "revision": "0000000000000011",
   "commit_id": "66b7d24d9d8c4f519b8c126e486fa953",
   "previous": {
-    "key": "v1/log/fffffffffffffff0.json",
+    "key": "v1/log/7fffffffffffffef.json",
     "record_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
   },
   "event": {"example": "the generic T appears here"},
@@ -268,12 +271,12 @@ characters.
       "refs": [
         {
           "level": 1,
-          "start": "0000000000000000",
-          "end": "000000000000000f",
-          "key": "v1/tree/1/0000000000000000-000000000000000f-<digest>.json.zst",
+          "start": "0000000000000001",
+          "end": "0000000000000010",
+          "key": "v1/tree/1/0000000000000001-0000000000000010-<digest>.json.zst",
           "sha256": "<digest>",
           "first_prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-          "last_record_hash": "<record-hash-at-revision-15>"
+          "last_record_hash": "<record-hash-at-revision-16>"
         }
       ]
     }
@@ -281,7 +284,7 @@ characters.
 }
 ```
 
-For revision 0, `previous` is `null` and `frontier` is empty. The frontier covers
+For revision 1, `previous` is `null` and `frontier` is empty. The frontier covers
 only records before this commit; the `event` in the commit is the final record
 of this historical view. This avoids a self-reference.
 
@@ -302,7 +305,7 @@ formatting:
 ```text
 SHA-256(
   "lokv-record-v1\x00" ||
-  uint64_big_endian(revision) ||
+  int64_big_endian(revision) ||
   commit_id_16_bytes ||
   previous_record_hash_32_bytes ||
   uint64_big_endian(len(event_json)) ||
@@ -310,7 +313,7 @@ SHA-256(
 )
 ```
 
-For revision 0, `previous_record_hash` is 32 zero bytes. This hash chain detects
+For revision 1, `previous_record_hash` is 32 zero bytes. This hash chain detects
 reordering, omission, and event corruption during scans. It is not a signature
 and does not defend against a malicious authorized writer.
 
@@ -343,11 +346,11 @@ A level-1 segment contains exactly 16 record projections in revision order:
 {
   "format": "lokv/segment/v1",
   "level": 1,
-  "start": "0000000000000000",
-  "end": "000000000000000f",
+  "start": "0000000000000001",
+  "end": "0000000000000010",
   "records": [
     {
-      "revision": "0000000000000000",
+      "revision": "0000000000000001",
       "commit_id": "<32 hex>",
       "previous_record_hash": "<64 hex>",
       "record_hash": "<64 hex>",
@@ -375,8 +378,8 @@ with the number of levels.
 {
   "format": "lokv/index/v1",
   "level": 2,
-  "start": "0000000000000000",
-  "end": "00000000000000ff",
+  "start": "0000000000000001",
+  "end": "0000000000000100",
   "children": [
     {"level": 1, "start": "...", "end": "...", "key": "...", "sha256": "...",
      "first_prev_hash": "...", "last_record_hash": "..."}
@@ -417,14 +420,14 @@ type CommitID [16]byte
 type RecordHash [32]byte
 
 type Record[T any] struct {
-    Revision   uint64
+    Revision   int64 // Starts at 1; values <= 0 are invalid.
     CommitID   CommitID
     Value      T
     RecordHash RecordHash
 }
 
 // Head returns (zero, false, nil) for an empty log.
-func (l *Log[T]) Head(ctx context.Context) (Record[T], bool, error)
+func (l *Log[T]) Head(ctx context.Context) (_ Record[T], ok bool, _ error)
 
 // Append marshals value once, discovers HEAD, and retries optimistic conflicts.
 func (l *Log[T]) Append(ctx context.Context, value T) (Record[T], error)
@@ -433,7 +436,7 @@ func (l *Log[T]) Append(ctx context.Context, value T) (Record[T], error)
 type Snapshot[T any] struct { /* exported accessors, private frontier */ }
 
 func (l *Log[T]) LoadHead(ctx context.Context) (*Snapshot[T], error)
-func (l *Log[T]) LoadRevision(ctx context.Context, revision uint64) (*Snapshot[T], error)
+func (l *Log[T]) LoadRevision(ctx context.Context, revision int64) (*Snapshot[T], error)
 
 // AppendTo attempts exactly one successor of base. It returns ErrConflict if
 // another writer wins. This avoids an extra LIST/GET when a caller already owns
@@ -441,8 +444,8 @@ func (l *Log[T]) LoadRevision(ctx context.Context, revision uint64) (*Snapshot[T
 func (l *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value T) (*Snapshot[T], error)
 
 type Range struct {
-    First uint64 // inclusive
-    Last  uint64 // inclusive
+    First int64 // inclusive, must be positive
+    Last  int64 // inclusive, must be positive
 }
 
 // Scan visits records in increasing revision order. It stops immediately on a
@@ -462,8 +465,9 @@ var (
 )
 ```
 
-`Snapshot` should expose `Record() Record[T]`, `Revision() uint64`, and perhaps
-`Empty() bool`, but not mutable frontier slices. Returning an opaque snapshot
+`Snapshot` should expose `Record() Record[T]`, `Revision() int64`, and perhaps
+`Empty() (empty bool)`, but not mutable frontier slices. A nil snapshot reports revision 0.
+`LoadRevision` rejects revisions <= 0 with `ErrRange`. Returning an opaque snapshot
 allows `AppendTo` to reuse the already fetched commit body safely.
 
 `Open` rejects a nil store, malformed prefix, invalid size limits, and negative
@@ -477,19 +481,19 @@ not `lokv.Config`.
 
 1. Marshal `T`; reject marshal errors and size violations before store writes.
 2. Generate one commit ID.
-3. Build revision-0 commit with no predecessor and empty frontier.
-4. `Store.Create(logKey(0), body)`.
-5. Success commits revision 0. `ErrExists` means another writer won; `Append` loads
+3. Build revision-1 commit with no predecessor and empty frontier.
+4. `Store.Create(logKey(1), body)`.
+5. Success commits revision 1. `ErrExists` means another writer won; `Append` loads
    the new head and retries while `AppendTo(nil, ...)` returns `ErrConflict`.
-6. For an ambiguous transport error, GET `logKey(0)`. Matching commit ID means
+6. For an ambiguous transport error, GET `logKey(1)`. Matching commit ID means
    success; a different existing commit means conflict; absence means retry the
    same conditional creation subject to context and retry policy.
 
 ### 9.2 Non-empty log
 
-The loaded head at revision `R` has a frontier covering `[0,R)`. The new commit
+The loaded head at revision `R` has a frontier covering `[1,R)`. The new commit
 will be revision `R+1`; first insert the old head as a level-0 reference so the
-new frontier covers `[0,R+1)`.
+new frontier covers `[1,R+1)`.
 
 ```text
 carry = ref(oldHead)
@@ -620,7 +624,7 @@ For `N` appended records:
 
 The permanent metadata cost of copying a bounded frontier into each commit is
 linear in `N`, not quadratic. Actual byte cost should be benchmarked because a
-near-maximum 240-reference frontier can be tens of kilobytes per append.
+near-maximum 231-reference frontier can be tens of kilobytes per append.
 
 ## 13. S3 adapter: IAM and bucket configuration
 
@@ -675,7 +679,9 @@ in v1. This keeps conditional-create behavior and failure handling simple.
 
 ## 14. Limits and defensive decoding
 
-- Reject append at revision `math.MaxUint64` with `ErrExhausted`.
+- Allow revision `math.MaxInt64`, then reject further appends with `ErrExhausted`.
+- Reject revisions <= 0 in public lookups and range scans with `ErrRange`.
+- Reject nonpositive or out-of-int64-range revisions in stored data with `ErrCorrupt`.
 - Reject invalid UTF-8 only as `encoding/json` normally handles it; the exact
   marshaled bytes are authoritative.
 - Limit event JSON before upload.
@@ -741,8 +747,8 @@ benchmarks even if production metrics hooks are deferred.
 
 At minimum:
 
-1. Reverse-key lexical ordering for revisions 0, 1, 15, 16,
-   `MaxUint64-1`, and `MaxUint64`.
+1. Reverse-key lexical ordering for revisions 1, 2, 15, 16, 17,
+   `MaxInt64-1`, and `MaxInt64`.
 2. Append/scan round trips for empty log and counts 1, 15, 16, 17, 255, 256,
    and 257.
 3. `Create`-count assertions at all carry boundaries.
@@ -807,7 +813,7 @@ numbers; timestamps may live inside `T` if useful.
 
 ### Full snapshots every M records
 
-Rejected because rewriting `[0..N]` after every fixed-size tail produces
+Rejected because rewriting `[1..N]` after every fixed-size tail produces
 quadratic aggregate history writes.
 
 ### Physical LSM compaction at every level
