@@ -801,8 +801,10 @@ At minimum:
     a newly committed reverse key and that a second conditional PUT receives
     412/409 as appropriate.
 
-Run unit tests with `go test -race ./...`. Add fuzz targets for key parsing,
-commit/node decoding, frontier validation, and segment decompression.
+Run unit tests with both `go test ./...` and `go test -race ./...`; race builds
+reduce the large boundary and crash workloads to two carry levels. Add fuzz
+targets for key parsing, commit/node decoding, frontier validation, and segment
+decompression.
 
 ## 18. Acceptance criteria
 

@@ -141,6 +141,9 @@ func TestReverseKeys(t *testing.T) {
 func TestBoundariesAndCounts(t *testing.T) {
 	for _, n := range []int{0, 1, 15, 16, 17, 255, 256, 257, 4097} {
 		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			if raceEnabled && n > 257 {
+				t.Skip("two carry levels suffice under the race detector")
+			}
 			s := newStore()
 			l := testLog[int](t, s)
 			var snap *Snapshot[int]
@@ -376,17 +379,22 @@ func TestAmbiguousSuccess(t *testing.T) {
 }
 
 func TestCrashAfterAggregate(t *testing.T) {
+	levels := 3
+	if raceEnabled {
+		levels = 2
+	}
+	n := 1 << (4 * levels)
 	s := newStore()
 	l := testLog[int](t, s)
-	base := build(t, l, 4096)
+	base := build(t, l, n)
 	original := make(map[string][]byte, len(s.objects))
 	for k, v := range s.objects {
 		original[k] = v
 	}
 	failure := errors.New("injected crash")
-	// Revision 4097 carries through segment, level 2, and level 3. Fail the
-	// following creation after each durable aggregate, including final commit.
-	for after := 1; after <= 3; after++ {
+	// The next revision carries through a segment and higher index levels.
+	// Fail the creation after each durable aggregate, including the final commit.
+	for after := 1; after <= levels; after++ {
 		t.Run(fmt.Sprint(after), func(t *testing.T) {
 			s.objects = make(map[string][]byte, len(original))
 			for k, v := range original {
@@ -400,18 +408,18 @@ func TestCrashAfterAggregate(t *testing.T) {
 				}
 				return nil
 			}
-			if _, err := l.AppendTo(context.Background(), base, 4096); !errors.Is(err, failure) {
+			if _, err := l.AppendTo(context.Background(), base, n); !errors.Is(err, failure) {
 				t.Fatalf("fault: %v", err)
 			}
 			head, err := l.LoadHead(context.Background())
-			if err != nil || head.Revision() != 4096 {
+			if err != nil || head.Revision() != int64(n) {
 				t.Fatalf("published incomplete commit: %v", err)
 			}
 			if err := l.Verify(context.Background(), head); err != nil {
 				t.Fatal(err)
 			}
 			s.before = nil
-			next, err := l.AppendTo(context.Background(), base, 4096)
+			next, err := l.AppendTo(context.Background(), base, n)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -244,6 +244,7 @@ The complete protocol, key layout, and hash definition are in [DESIGN.md](DESIGN
 ## Validation
 
 ```sh
+go test ./...
 go test -race ./...
 go vet ./...
 go test -run '^$' -bench . -benchmem
@@ -251,7 +252,9 @@ go test -run '^$' -bench . -benchmem
 
 Tests cover carry boundaries through revision 4097, request counts, concurrent
 writers, crash injection, ambiguous success, corruption, pruning, and resource
-limits. HTTP tests exercise the actual AWS SDK request headers and status mapping.
+limits. Under `-race`, the large boundary and crash tests use two carry levels
+(through revision 257); normal runs cover three. CI runs both modes. HTTP tests
+exercise the actual AWS SDK request headers and status mapping.
 Benchmarks report store requests and average carry depth alongside allocations.
 Fuzz targets cover key parsing, commit and index decoding, frontier validation,
 and segment decompression; for example:
