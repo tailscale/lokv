@@ -61,11 +61,11 @@ func After(revision int64) Range {
 // Successfully yielded records are not rolled back if a later read or callback
 // fails. Advance an application's last-applied revision only after its update
 // succeeds, and keep it consistent with the application's index on retries.
-func (l *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield func(Record[T]) error) error {
+func (lg *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield func(Record[T]) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := l.checkSnapshot(snap); err != nil {
+	if err := lg.checkSnapshot(snap); err != nil {
 		return err
 	}
 	if r != (Range{}) && (r.First <= 0 || r.First > r.Last || r.Last > MaxRevision) {
@@ -78,7 +78,7 @@ func (l *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield fun
 		return nil
 	}
 	r.Last = min(r.Last, snap.Revision())
-	if err := l.validateFrontier(snap.commit.Frontier, snap.Revision(), snap.commit.project().PreviousRecordHash); err != nil {
+	if err := lg.validateFrontier(snap.commit.Frontier, snap.Revision(), snap.commit.project().PreviousRecordHash); err != nil {
 		return err
 	}
 	next, chain, done := r.First, "", false
@@ -96,7 +96,7 @@ func (l *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield fun
 		if done || revision != next || chain != "" && p.PreviousRecordHash != chain {
 			return corrupt("scan record chain mismatch")
 		}
-		record, err := l.record(p)
+		record, err := lg.record(p)
 		if err != nil {
 			return err
 		}
@@ -116,7 +116,7 @@ func (l *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield fun
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		start, end, err := l.validateRef(ref)
+		start, end, err := lg.validateRef(ref)
 		if err != nil {
 			return err
 		}
@@ -124,18 +124,18 @@ func (l *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield fun
 			return nil
 		}
 		if ref.Level == 0 {
-			c, err := l.loadCommitRef(ctx, ref, nil)
+			c, err := lg.loadCommitRef(ctx, ref, nil)
 			if err != nil {
 				return fmt.Errorf("scan %s: %w", ref.Key, err)
 			}
 			return emit(c.project())
 		}
-		body, err := l.get(ctx, ref.Key, true)
+		body, err := lg.get(ctx, ref.Key, true)
 		if err != nil {
 			return err
 		}
 		if ref.Level == 1 {
-			seg, err := l.decodeSegment(ref, body)
+			seg, err := lg.decodeSegment(ref, body)
 			if err != nil {
 				return fmt.Errorf("scan %s: %w", ref.Key, err)
 			}
@@ -146,7 +146,7 @@ func (l *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield fun
 			}
 			return nil
 		}
-		node, err := l.decodeIndex(ref, body)
+		node, err := lg.decodeIndex(ref, body)
 		if err != nil {
 			return fmt.Errorf("scan %s: %w", ref.Key, err)
 		}
@@ -176,15 +176,15 @@ func (l *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield fun
 // Verify checks every reachable tree object's structure and digest and the full
 // record chain. Empty snapshots verify successfully. Superseded raw commits and
 // unreachable carry objects are not part of the snapshot's tree.
-func (l *Log[T]) Verify(ctx context.Context, snap *Snapshot[T]) error {
+func (lg *Log[T]) Verify(ctx context.Context, snap *Snapshot[T]) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := l.checkSnapshot(snap); err != nil {
+	if err := lg.checkSnapshot(snap); err != nil {
 		return err
 	}
 	if snap == nil {
 		return nil
 	}
-	return l.Scan(ctx, snap, All(), func(Record[T]) error { return nil })
+	return lg.Scan(ctx, snap, All(), func(Record[T]) error { return nil })
 }

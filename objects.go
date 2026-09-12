@@ -16,17 +16,17 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-func (l *Log[T]) commitRef(s *Snapshot[T]) objectRef {
+func (lg *Log[T]) commitRef(s *Snapshot[T]) objectRef {
 	p := s.commit.project()
-	return objectRef{0, p.Revision, p.Revision, l.logKey(s.Revision()), digest(s.body), p.PreviousRecordHash, p.RecordHash}
+	return objectRef{0, p.Revision, p.Revision, lg.logKey(s.Revision()), digest(s.body), p.PreviousRecordHash, p.RecordHash}
 }
 
-func (l *Log[T]) carry(ctx context.Context, base *Snapshot[T]) ([]frontierLevel, error) {
+func (lg *Log[T]) carry(ctx context.Context, base *Snapshot[T]) ([]frontierLevel, error) {
 	var levels [16][]objectRef
 	for _, f := range base.commit.Frontier {
 		levels[f.Level] = append([]objectRef(nil), f.Refs...)
 	}
-	carry := l.commitRef(base)
+	carry := lg.commitRef(base)
 	for level := 0; level < 16; level++ {
 		levels[level] = append(levels[level], carry)
 		if len(levels[level]) < 16 {
@@ -34,9 +34,9 @@ func (l *Log[T]) carry(ctx context.Context, base *Snapshot[T]) ([]frontierLevel,
 		}
 		var err error
 		if level == 0 {
-			carry, err = l.createSegment(ctx, levels[0], base)
+			carry, err = lg.createSegment(ctx, levels[0], base)
 		} else {
-			carry, err = l.createIndex(ctx, uint8(level+1), levels[level])
+			carry, err = lg.createIndex(ctx, uint8(level+1), levels[level])
 		}
 		if err != nil {
 			return nil, err
@@ -56,8 +56,8 @@ func aggregateRef(level uint8, children []objectRef) objectRef {
 	return objectRef{Level: level, Start: children[0].Start, End: children[len(children)-1].End, FirstPrevHash: children[0].FirstPrevHash, LastRecordHash: children[len(children)-1].LastRecordHash}
 }
 
-func (l *Log[T]) validateChildren(ref objectRef, children []objectRef) error {
-	start, end, err := l.validateRef(ref)
+func (lg *Log[T]) validateChildren(ref objectRef, children []objectRef) error {
+	start, end, err := lg.validateRef(ref)
 	if err != nil {
 		return err
 	}
@@ -66,7 +66,7 @@ func (l *Log[T]) validateChildren(ref objectRef, children []objectRef) error {
 	}
 	next, chain := start, ref.FirstPrevHash
 	for i, child := range children {
-		cs, ce, err := l.validateRef(child)
+		cs, ce, err := lg.validateRef(child)
 		if err != nil {
 			return err
 		}
@@ -91,19 +91,19 @@ func (l *Log[T]) validateChildren(ref objectRef, children []objectRef) error {
 	return nil
 }
 
-func (l *Log[T]) loadCommitRef(ctx context.Context, ref objectRef, cached *Snapshot[T]) (*commit, error) {
-	if _, _, err := l.validateRef(ref); err != nil {
+func (lg *Log[T]) loadCommitRef(ctx context.Context, ref objectRef, cached *Snapshot[T]) (*commit, error) {
+	if _, _, err := lg.validateRef(ref); err != nil {
 		return nil, err
 	}
 	if ref.Level != 0 {
 		return nil, corrupt("expected commit reference")
 	}
 	var b []byte
-	if cached != nil && ref.Key == l.logKey(cached.Revision()) {
+	if cached != nil && ref.Key == lg.logKey(cached.Revision()) {
 		b = cached.body
 	} else {
 		var err error
-		b, err = l.get(ctx, ref.Key, true)
+		b, err = lg.get(ctx, ref.Key, true)
 		if err != nil {
 			return nil, err
 		}
@@ -111,7 +111,7 @@ func (l *Log[T]) loadCommitRef(ctx context.Context, ref objectRef, cached *Snaps
 	if digest(b) != ref.SHA256 {
 		return nil, corrupt("commit object digest mismatch")
 	}
-	c, err := l.decodeCommit(ref.Key, b)
+	c, err := lg.decodeCommit(ref.Key, b)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +122,7 @@ func (l *Log[T]) loadCommitRef(ctx context.Context, ref objectRef, cached *Snaps
 	return c, nil
 }
 
-func (l *Log[T]) createSegment(ctx context.Context, children []objectRef, base *Snapshot[T]) (objectRef, error) {
+func (lg *Log[T]) createSegment(ctx context.Context, children []objectRef, base *Snapshot[T]) (objectRef, error) {
 	ref := aggregateRef(1, children)
 	records := make([]projection, 16)
 	workCtx, cancel := context.WithCancel(ctx)
@@ -139,12 +139,12 @@ func (l *Log[T]) createSegment(ctx context.Context, children []objectRef, base *
 				if workCtx.Err() != nil {
 					return
 				}
-				c, err := l.loadCommitRef(workCtx, children[i], base)
+				c, err := lg.loadCommitRef(workCtx, children[i], base)
 				if err != nil {
 					once.Do(func() { firstErr = err; cancel() })
 					return
 				}
-				if eventBytes.Add(int64(len(c.Event))) > l.maxObject {
+				if eventBytes.Add(int64(len(c.Event))) > lg.maxObject {
 					once.Do(func() { firstErr = ErrTooLarge; cancel() })
 					return
 				}
@@ -164,12 +164,12 @@ func (l *Log[T]) createSegment(ctx context.Context, children []objectRef, base *
 	if err != nil {
 		return objectRef{}, errors.New("lokv: encode segment")
 	}
-	if int64(len(raw)) > l.maxObject {
+	if int64(len(raw)) > lg.maxObject {
 		return objectRef{}, ErrTooLarge
 	}
 	ref.SHA256 = digest(raw)
-	ref.Key = l.treeKey(ref)
-	if err := l.validateSegment(ref, &seg); err != nil {
+	ref.Key = lg.treeKey(ref)
+	if err := lg.validateSegment(ref, &seg); err != nil {
 		return objectRef{}, err
 	}
 	enc, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1), zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithWindowSize(1<<20), zstd.WithEncoderCRC(true))
@@ -178,13 +178,13 @@ func (l *Log[T]) createSegment(ctx context.Context, children []objectRef, base *
 	}
 	body := enc.EncodeAll(raw, nil)
 	enc.Close()
-	if err := l.createAggregate(ctx, ref, body); err != nil {
+	if err := lg.createAggregate(ctx, ref, body); err != nil {
 		return objectRef{}, err
 	}
 	return ref, nil
 }
 
-func (l *Log[T]) createIndex(ctx context.Context, level uint8, children []objectRef) (objectRef, error) {
+func (lg *Log[T]) createIndex(ctx context.Context, level uint8, children []objectRef) (objectRef, error) {
 	ref := aggregateRef(level, children)
 	node := indexNode{indexFormat, level, ref.Start, ref.End, children}
 	body, err := json.Marshal(node)
@@ -192,28 +192,28 @@ func (l *Log[T]) createIndex(ctx context.Context, level uint8, children []object
 		return objectRef{}, errors.New("lokv: encode index")
 	}
 	ref.SHA256 = digest(body)
-	ref.Key = l.treeKey(ref)
-	if err := l.validateChildren(ref, children); err != nil {
+	ref.Key = lg.treeKey(ref)
+	if err := lg.validateChildren(ref, children); err != nil {
 		return objectRef{}, err
 	}
-	if err := l.createAggregate(ctx, ref, body); err != nil {
+	if err := lg.createAggregate(ctx, ref, body); err != nil {
 		return objectRef{}, err
 	}
 	return ref, nil
 }
 
-func (l *Log[T]) createAggregate(ctx context.Context, ref objectRef, body []byte) error {
-	if int64(len(body)) > l.maxObject {
+func (lg *Log[T]) createAggregate(ctx context.Context, ref objectRef, body []byte) error {
+	if int64(len(body)) > lg.maxObject {
 		return ErrTooLarge
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	createErr := l.store.Create(ctx, ref.Key, body)
+	createErr := lg.store.Create(ctx, ref.Key, body)
 	if createErr == nil {
 		return nil
 	}
-	actual, err := l.get(ctx, ref.Key, true)
+	actual, err := lg.get(ctx, ref.Key, true)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) && !errors.Is(createErr, ErrExists) {
 			return fmt.Errorf("create %s: %w", ref.Key, createErr)
@@ -221,9 +221,9 @@ func (l *Log[T]) createAggregate(ctx context.Context, ref objectRef, body []byte
 		return err
 	}
 	if ref.Level == 1 {
-		_, err = l.decodeSegment(ref, actual)
+		_, err = lg.decodeSegment(ref, actual)
 	} else {
-		_, err = l.decodeIndex(ref, actual)
+		_, err = lg.decodeIndex(ref, actual)
 	}
 	return err
 }
@@ -266,24 +266,24 @@ func singleFrame(b []byte) (zstd.Header, error) {
 	return h, nil
 }
 
-func (l *Log[T]) decompress(body []byte) ([]byte, error) {
-	if int64(len(body)) > l.maxObject {
+func (lg *Log[T]) decompress(body []byte) ([]byte, error) {
+	if int64(len(body)) > lg.maxObject {
 		return nil, fmt.Errorf("%w: %w", ErrCorrupt, ErrTooLarge)
 	}
 	h, err := singleFrame(body)
 	if err != nil {
 		return nil, err
 	}
-	if h.HasFCS && h.FrameContentSize > uint64(l.maxObject) {
+	if h.HasFCS && h.FrameContentSize > uint64(lg.maxObject) {
 		return nil, fmt.Errorf("%w: %w", ErrCorrupt, ErrTooLarge)
 	}
-	dec, err := zstd.NewReader(bytes.NewReader(body), zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(uint64(max(l.maxObject, 1<<20))), zstd.WithDecoderMaxWindow(1<<20))
+	dec, err := zstd.NewReader(bytes.NewReader(body), zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(uint64(max(lg.maxObject, 1<<20))), zstd.WithDecoderMaxWindow(1<<20))
 	if err != nil {
 		return nil, corrupt("invalid zstd stream")
 	}
 	defer dec.Close()
-	raw, err := io.ReadAll(io.LimitReader(dec, l.maxObject+1))
-	if int64(len(raw)) > l.maxObject || errors.Is(err, zstd.ErrDecoderSizeExceeded) || errors.Is(err, zstd.ErrWindowSizeExceeded) {
+	raw, err := io.ReadAll(io.LimitReader(dec, lg.maxObject+1))
+	if int64(len(raw)) > lg.maxObject || errors.Is(err, zstd.ErrDecoderSizeExceeded) || errors.Is(err, zstd.ErrWindowSizeExceeded) {
 		return nil, fmt.Errorf("%w: %w", ErrCorrupt, ErrTooLarge)
 	}
 	if err != nil {
@@ -292,8 +292,8 @@ func (l *Log[T]) decompress(body []byte) ([]byte, error) {
 	return raw, nil
 }
 
-func (l *Log[T]) validateSegment(ref objectRef, seg *segment) error {
-	start, _, err := l.validateRef(ref)
+func (lg *Log[T]) validateSegment(ref objectRef, seg *segment) error {
+	start, _, err := lg.validateRef(ref)
 	if err != nil {
 		return err
 	}
@@ -302,7 +302,7 @@ func (l *Log[T]) validateSegment(ref objectRef, seg *segment) error {
 	}
 	chain := ref.FirstPrevHash
 	for i, p := range seg.Records {
-		revision, err := l.validateProjection(p)
+		revision, err := lg.validateProjection(p)
 		if err != nil {
 			return err
 		}
@@ -317,8 +317,8 @@ func (l *Log[T]) validateSegment(ref objectRef, seg *segment) error {
 	return nil
 }
 
-func (l *Log[T]) decodeSegment(ref objectRef, body []byte) (*segment, error) {
-	raw, err := l.decompress(body)
+func (lg *Log[T]) decodeSegment(ref objectRef, body []byte) (*segment, error) {
+	raw, err := lg.decompress(body)
 	if err != nil {
 		return nil, err
 	}
@@ -329,14 +329,14 @@ func (l *Log[T]) decodeSegment(ref objectRef, body []byte) (*segment, error) {
 	if err := decodeJSON(raw, &seg); err != nil {
 		return nil, err
 	}
-	if err := l.validateSegment(ref, &seg); err != nil {
+	if err := lg.validateSegment(ref, &seg); err != nil {
 		return nil, err
 	}
 	return &seg, nil
 }
 
-func (l *Log[T]) decodeIndex(ref objectRef, body []byte) (*indexNode, error) {
-	if int64(len(body)) > l.maxObject {
+func (lg *Log[T]) decodeIndex(ref objectRef, body []byte) (*indexNode, error) {
+	if int64(len(body)) > lg.maxObject {
 		return nil, fmt.Errorf("%w: %w", ErrCorrupt, ErrTooLarge)
 	}
 	if digest(body) != ref.SHA256 {
@@ -349,7 +349,7 @@ func (l *Log[T]) decodeIndex(ref objectRef, body []byte) (*indexNode, error) {
 	if node.Format != indexFormat || node.Level != ref.Level || node.Start != ref.Start || node.End != ref.End {
 		return nil, corrupt("index envelope mismatch")
 	}
-	if err := l.validateChildren(ref, node.Children); err != nil {
+	if err := lg.validateChildren(ref, node.Children); err != nil {
 		return nil, err
 	}
 	return &node, nil

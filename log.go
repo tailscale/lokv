@@ -144,9 +144,9 @@ func (s *Snapshot[T]) Revision() int64 {
 // Empty reports whether the snapshot represents an empty log.
 func (s *Snapshot[T]) Empty() (empty bool) { return s == nil }
 
-func (l *Log[T]) record(p projection) (Record[T], error) {
+func (lg *Log[T]) record(p projection) (Record[T], error) {
 	var r Record[T]
-	revision, err := l.validateProjection(p)
+	revision, err := lg.validateProjection(p)
 	if err != nil {
 		return r, err
 	}
@@ -161,20 +161,20 @@ func (l *Log[T]) record(p projection) (Record[T], error) {
 	return r, nil
 }
 
-func (l *Log[T]) snapshot(key string, body []byte) (*Snapshot[T], error) {
-	c, err := l.decodeCommit(key, body)
+func (lg *Log[T]) snapshot(key string, body []byte) (*Snapshot[T], error) {
+	c, err := lg.decodeCommit(key, body)
 	if err != nil {
 		return nil, fmt.Errorf("load %s: %w", key, err)
 	}
-	r, err := l.record(c.project())
+	r, err := lg.record(c.project())
 	if err != nil {
 		return nil, fmt.Errorf("load %s: %w", key, err)
 	}
-	return &Snapshot[T]{l, c, body, r}, nil
+	return &Snapshot[T]{lg, c, body, r}, nil
 }
 
-func (l *Log[T]) checkSnapshot(s *Snapshot[T]) error {
-	if s != nil && (s.owner != l || s.commit == nil) {
+func (lg *Log[T]) checkSnapshot(s *Snapshot[T]) error {
+	if s != nil && (s.owner != lg || s.commit == nil) {
 		return errors.New("lokv: snapshot belongs to a different log or is uninitialized")
 	}
 	if s != nil && (s.Revision() <= 0 || s.Revision() > MaxRevision) {
@@ -183,18 +183,18 @@ func (l *Log[T]) checkSnapshot(s *Snapshot[T]) error {
 	return nil
 }
 
-func (l *Log[T]) get(ctx context.Context, key string, referenced bool) ([]byte, error) {
+func (lg *Log[T]) get(ctx context.Context, key string, referenced bool) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	b, err := l.store.Get(ctx, key)
+	b, err := lg.store.Get(ctx, key)
 	if err != nil {
 		if referenced && (errors.Is(err, ErrNotFound) || errors.Is(err, ErrTooLarge)) {
 			err = fmt.Errorf("%w: %w", ErrCorrupt, err)
 		}
 		return nil, fmt.Errorf("get %s: %w", key, err)
 	}
-	if int64(len(b)) > l.maxObject {
+	if int64(len(b)) > lg.maxObject {
 		return nil, fmt.Errorf("get %s: %w: %w", key, ErrCorrupt, ErrTooLarge)
 	}
 	return b, nil
@@ -213,13 +213,13 @@ func (l *Log[T]) get(ctx context.Context, key string, referenced bool) ([]byte, 
 // Log does not provide notifications; callers arrange polling or wakeups. A
 // caller that already knows a committed revision can use [Log.LoadRevision]
 // to load that root with one Get and no List.
-func (l *Log[T]) LoadHead(ctx context.Context) (*Snapshot[T], error) {
+func (lg *Log[T]) LoadHead(ctx context.Context) (*Snapshot[T], error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	keys, err := l.store.List(ctx, l.logPrefix(), 1)
+	keys, err := lg.store.List(ctx, lg.logPrefix(), 1)
 	if err != nil {
-		return nil, fmt.Errorf("list %s: %w", l.logPrefix(), err)
+		return nil, fmt.Errorf("list %s: %w", lg.logPrefix(), err)
 	}
 	if len(keys) == 0 {
 		return nil, nil
@@ -227,14 +227,14 @@ func (l *Log[T]) LoadHead(ctx context.Context) (*Snapshot[T], error) {
 	if len(keys) != 1 {
 		return nil, corrupt("store exceeded LIST limit")
 	}
-	if _, err := l.parseLogKey(keys[0]); err != nil {
+	if _, err := lg.parseLogKey(keys[0]); err != nil {
 		return nil, err
 	}
-	b, err := l.get(ctx, keys[0], true)
+	b, err := lg.get(ctx, keys[0], true)
 	if err != nil {
 		return nil, err
 	}
-	return l.snapshot(keys[0], b)
+	return lg.snapshot(keys[0], b)
 }
 
 // LoadRevision loads a historical root without listing. An absent requested
@@ -246,37 +246,37 @@ func (l *Log[T]) LoadHead(ctx context.Context) (*Snapshot[T], error) {
 // [MaxRevision] before incrementing. If a successor exists, LoadHead can discover
 // the latest root for a batch catch-up, at the cost of an extra probe Get on
 // active polls. See the follow example for [Log.Scan].
-func (l *Log[T]) LoadRevision(ctx context.Context, revision int64) (*Snapshot[T], error) {
+func (lg *Log[T]) LoadRevision(ctx context.Context, revision int64) (*Snapshot[T], error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if revision <= 0 || revision > MaxRevision {
 		return nil, ErrRange
 	}
-	key := l.logKey(revision)
-	b, err := l.get(ctx, key, false)
+	key := lg.logKey(revision)
+	b, err := lg.get(ctx, key, false)
 	if err != nil {
 		return nil, err
 	}
-	return l.snapshot(key, b)
+	return lg.snapshot(key, b)
 }
 
 // Head returns the latest event. ok reports whether a record was returned.
 // An empty log returns (zero, false, nil).
-func (l *Log[T]) Head(ctx context.Context) (_ Record[T], ok bool, _ error) {
-	s, err := l.LoadHead(ctx)
+func (lg *Log[T]) Head(ctx context.Context) (_ Record[T], ok bool, _ error) {
+	s, err := lg.LoadHead(ctx)
 	if err != nil || s == nil {
 		return Record[T]{}, false, err
 	}
 	return s.Record(), true, nil
 }
 
-func (l *Log[T]) prepare(value T) (json.RawMessage, string, error) {
+func (lg *Log[T]) prepare(value T) (json.RawMessage, string, error) {
 	b, err := json.Marshal(value)
 	if err != nil {
 		return nil, "", &eventCodecError{"marshal", err}
 	}
-	if int64(len(b)) > l.maxEvent {
+	if int64(len(b)) > lg.maxEvent {
 		return nil, "", ErrTooLarge
 	}
 	var id CommitID
@@ -290,24 +290,24 @@ func (l *Log[T]) prepare(value T) (json.RawMessage, string, error) {
 // The first record has revision 1. Appending after [MaxRevision] returns ErrExhausted.
 // Transport retries belong to the adapter. An unresolved transport error is
 // returned, since the core cannot classify arbitrary backend errors as retryable.
-func (l *Log[T]) Append(ctx context.Context, value T) (Record[T], error) {
+func (lg *Log[T]) Append(ctx context.Context, value T) (Record[T], error) {
 	if err := ctx.Err(); err != nil {
 		return Record[T]{}, err
 	}
-	event, id, err := l.prepare(value)
+	event, id, err := lg.prepare(value)
 	if err != nil {
 		return Record[T]{}, err
 	}
 	for attempt := 0; ; attempt++ {
-		base, err := l.LoadHead(ctx)
+		base, err := lg.LoadHead(ctx)
 		if err != nil {
 			return Record[T]{}, err
 		}
-		s, err := l.appendPrepared(ctx, base, event, id)
+		s, err := lg.appendPrepared(ctx, base, event, id)
 		if err == nil {
 			return s.Record(), nil
 		}
-		if !errors.Is(err, ErrConflict) || attempt >= l.maxRetries {
+		if !errors.Is(err, ErrConflict) || attempt >= lg.maxRetries {
 			return Record[T]{}, err
 		}
 	}
@@ -329,25 +329,25 @@ func (l *Log[T]) Append(ctx context.Context, value T) (Record[T], error) {
 // it as the next base. Reusing a loaded or returned snapshot avoids the List and
 // head Get performed by Append; carries may still read historical objects. Both
 // base and the returned snapshot remain immutable historical views.
-func (l *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value T) (*Snapshot[T], error) {
+func (lg *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value T) (*Snapshot[T], error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := l.checkSnapshot(base); err != nil {
+	if err := lg.checkSnapshot(base); err != nil {
 		return nil, err
 	}
 	if base != nil && base.Revision() == MaxRevision {
 		return nil, ErrExhausted
 	}
-	event, id, err := l.prepare(value)
+	event, id, err := lg.prepare(value)
 	if err != nil {
 		return nil, err
 	}
-	return l.appendPrepared(ctx, base, event, id)
+	return lg.appendPrepared(ctx, base, event, id)
 }
 
-func (l *Log[T]) appendPrepared(ctx context.Context, base *Snapshot[T], event json.RawMessage, id string) (*Snapshot[T], error) {
-	if err := l.checkSnapshot(base); err != nil {
+func (lg *Log[T]) appendPrepared(ctx context.Context, base *Snapshot[T], event json.RawMessage, id string) (*Snapshot[T], error) {
+	if err := lg.checkSnapshot(base); err != nil {
 		return nil, err
 	}
 	revision := int64(1)
@@ -358,9 +358,9 @@ func (l *Log[T]) appendPrepared(ctx context.Context, base *Snapshot[T], event js
 			return nil, ErrExhausted
 		}
 		revision = base.Revision() + 1
-		prev = &previous{l.logKey(base.Revision()), base.commit.RecordHash}
+		prev = &previous{lg.logKey(base.Revision()), base.commit.RecordHash}
 		var err error
-		frontier, err = l.carry(ctx, base)
+		frontier, err = lg.carry(ctx, base)
 		if err != nil {
 			return nil, err
 		}
@@ -369,7 +369,7 @@ func (l *Log[T]) appendPrepared(ctx context.Context, base *Snapshot[T], event js
 	if prev != nil {
 		prevHash = prev.RecordHash
 	}
-	if err := l.validateFrontier(frontier, revision, prevHash); err != nil {
+	if err := lg.validateFrontier(frontier, revision, prevHash); err != nil {
 		return nil, err
 	}
 	c := commit{commitFormat, hexRevision(revision), id, prev, event, recordHash(revision, id, prevHash, event), frontier}
@@ -377,26 +377,26 @@ func (l *Log[T]) appendPrepared(ctx context.Context, base *Snapshot[T], event js
 	if err != nil {
 		return nil, errors.New("lokv: encode commit")
 	}
-	if int64(len(body)) > l.maxObject {
+	if int64(len(body)) > lg.maxObject {
 		return nil, ErrTooLarge
 	}
-	key := l.logKey(revision)
+	key := lg.logKey(revision)
 	// Decode before publishing: a T with an incompatible UnmarshalJSON must not
 	// cause an append to commit and only then report a decoding failure.
-	s, err := l.snapshot(key, body)
+	s, err := lg.snapshot(key, body)
 	if err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	createErr := l.store.Create(ctx, key, body)
+	createErr := lg.store.Create(ctx, key, body)
 	if createErr == nil {
 		return s, nil
 	}
 	// Both ErrExists and ambiguous errors can represent an earlier successful
 	// adapter retry. Always inspect the attempted key before choosing a new one.
-	actual, err := l.get(ctx, key, false)
+	actual, err := lg.get(ctx, key, false)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			if errors.Is(createErr, ErrExists) {
@@ -406,7 +406,7 @@ func (l *Log[T]) appendPrepared(ctx context.Context, base *Snapshot[T], event js
 		}
 		return nil, err
 	}
-	winner, err := l.snapshot(key, actual)
+	winner, err := lg.snapshot(key, actual)
 	if err != nil {
 		return nil, err
 	}

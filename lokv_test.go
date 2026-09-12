@@ -93,19 +93,19 @@ func (s *testStore) Create(ctx context.Context, key string, body []byte) error {
 
 func testLog[T any](t testing.TB, s Store) *Log[T] {
 	t.Helper()
-	l, err := Open[T](Config{Store: s})
+	lg, err := Open[T](Config{Store: s})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return l
+	return lg
 }
 
-func build(t testing.TB, l *Log[int], n int) *Snapshot[int] {
+func build(t testing.TB, lg *Log[int], n int) *Snapshot[int] {
 	t.Helper()
 	var snap *Snapshot[int]
 	for i := 0; i < n; i++ {
 		var err error
-		snap, err = l.AppendTo(context.Background(), snap, i)
+		snap, err = lg.AppendTo(context.Background(), snap, i)
 		if err != nil {
 			t.Fatalf("append %d: %v", i, err)
 		}
@@ -114,25 +114,25 @@ func build(t testing.TB, l *Log[int], n int) *Snapshot[int] {
 }
 
 func TestReverseKeys(t *testing.T) {
-	l := testLog[int](t, newStore())
+	lg := testLog[int](t, newStore())
 	revisions := []int64{1, 2, 15, 16, 17, MaxRevision - 1, MaxRevision}
 	keys := make([]string, len(revisions))
 	for i, r := range revisions {
-		keys[i] = l.logKey(r)
-		actual, err := l.parseLogKey(keys[i])
+		keys[i] = lg.logKey(r)
+		actual, err := lg.parseLogKey(keys[i])
 		if err != nil || actual != r {
 			t.Fatalf("%d: %d %v", r, actual, err)
 		}
 	}
 	sort.Strings(keys)
 	for i, key := range keys {
-		r, _ := l.parseLogKey(key)
+		r, _ := lg.parseLogKey(key)
 		if r != revisions[len(revisions)-1-i] {
 			t.Fatal("incorrect lexical order")
 		}
 	}
 	for _, key := range []string{"v1/log/FFFFFFFFFFFFFFFF.json", "v1/log/fff.json", "else/v1/log/ffffffffffffffff.json", "v1/log/ffffffffffffffff.json/", "v1/log/000000000000000g.json"} {
-		if _, err := l.parseLogKey(key); !errors.Is(err, ErrCorrupt) {
+		if _, err := lg.parseLogKey(key); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("accepted %s", key)
 		}
 	}
@@ -145,12 +145,12 @@ func TestBoundariesAndCounts(t *testing.T) {
 				t.Skip("two carry levels suffice under the race detector")
 			}
 			s := newStore()
-			l := testLog[int](t, s)
+			lg := testLog[int](t, s)
 			var snap *Snapshot[int]
 			for i := 0; i < n; i++ {
 				before := s.creates
 				var err error
-				snap, err = l.AppendTo(context.Background(), snap, i)
+				snap, err = lg.AppendTo(context.Background(), snap, i)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -161,12 +161,12 @@ func TestBoundariesAndCounts(t *testing.T) {
 				if got := s.creates - before; got != 1+depth {
 					t.Fatalf("revision %d creations %d; want %d", i+1, got, 1+depth)
 				}
-				if err := l.validateFrontier(snap.commit.Frontier, int64(i+1), snap.commit.project().PreviousRecordHash); err != nil {
+				if err := lg.validateFrontier(snap.commit.Frontier, int64(i+1), snap.commit.project().PreviousRecordHash); err != nil {
 					t.Fatal(err)
 				}
 			}
 			beforeLists, beforeGets := s.lists, s.gets
-			head, ok, err := l.Head(context.Background())
+			head, ok, err := lg.Head(context.Background())
 			if err != nil || ok != (n > 0) {
 				t.Fatalf("head: %v %v", ok, err)
 			}
@@ -174,10 +174,10 @@ func TestBoundariesAndCounts(t *testing.T) {
 				t.Fatal("HEAD request count")
 			}
 			if n == 0 {
-				if err := l.Verify(context.Background(), nil); err != nil {
+				if err := lg.Verify(context.Background(), nil); err != nil {
 					t.Fatal(err)
 				}
-				if err := l.Scan(context.Background(), nil, All(), func(Record[int]) error { t.Fatal("empty scan yielded a record"); return nil }); err != nil {
+				if err := lg.Scan(context.Background(), nil, All(), func(Record[int]) error { t.Fatal("empty scan yielded a record"); return nil }); err != nil {
 					t.Fatal(err)
 				}
 				return
@@ -186,7 +186,7 @@ func TestBoundariesAndCounts(t *testing.T) {
 				t.Fatal(head)
 			}
 			var got []int
-			err = l.Scan(context.Background(), snap, Range{1, int64(n)}, func(r Record[int]) error {
+			err = lg.Scan(context.Background(), snap, Range{1, int64(n)}, func(r Record[int]) error {
 				if r.Revision != int64(len(got)+1) {
 					t.Fatal("unordered scan")
 				}
@@ -201,19 +201,19 @@ func TestBoundariesAndCounts(t *testing.T) {
 					t.Fatalf("record %d = %d", i, v)
 				}
 			}
-			if err := l.Verify(context.Background(), snap); err != nil {
+			if err := lg.Verify(context.Background(), snap); err != nil {
 				t.Fatal(err)
 			}
 			if n > 16 {
 				lists := s.lists
-				old, err := l.LoadRevision(context.Background(), 16)
+				old, err := lg.LoadRevision(context.Background(), 16)
 				if err != nil {
 					t.Fatal(err)
 				}
 				if s.lists != lists {
 					t.Fatal("historical load listed")
 				}
-				if err := l.Verify(context.Background(), old); err != nil {
+				if err := lg.Verify(context.Background(), old); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -238,17 +238,17 @@ func (v *customJSON) UnmarshalJSON(b []byte) error {
 func roundTrip[T any](t *testing.T, value T) {
 	t.Helper()
 	s := newStore()
-	l := testLog[T](t, s)
+	lg := testLog[T](t, s)
 	for i := 0; i < 17; i++ {
-		if _, err := l.Append(context.Background(), value); err != nil {
+		if _, err := lg.Append(context.Background(), value); err != nil {
 			t.Fatal(err)
 		}
 	}
-	snap, err := l.LoadHead(context.Background())
+	snap, err := lg.LoadHead(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := l.Scan(context.Background(), snap, Range{1, 17}, func(r Record[T]) error {
+	if err := lg.Scan(context.Background(), snap, Range{1, 17}, func(r Record[T]) error {
 		if !reflect.DeepEqual(r.Value, value) {
 			t.Fatalf("round trip: %#v != %#v", r.Value, value)
 		}
@@ -276,8 +276,8 @@ func TestGenericJSON(t *testing.T) {
 
 func TestMarshalFailureNoIO(t *testing.T) {
 	s := newStore()
-	l := testLog[any](t, s)
-	if _, err := l.Append(context.Background(), func() {}); err == nil {
+	lg := testLog[any](t, s)
+	if _, err := lg.Append(context.Background(), func() {}); err == nil {
 		t.Fatal("marshal succeeded")
 	}
 	if s.creates+s.gets+s.lists != 0 {
@@ -289,7 +289,7 @@ func TestConcurrentAppend(t *testing.T) {
 	for _, n := range []int{2, 32} {
 		t.Run(fmt.Sprint(n), func(t *testing.T) {
 			s := newStore()
-			l, err := Open[int](Config{Store: s, MaxConflictRetries: 128})
+			lg, err := Open[int](Config{Store: s, MaxConflictRetries: 128})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -298,14 +298,14 @@ func TestConcurrentAppend(t *testing.T) {
 			for i := 0; i < n; i++ {
 				wg.Go(func() {
 					<-start
-					if _, err := l.Append(context.Background(), i); err != nil {
+					if _, err := lg.Append(context.Background(), i); err != nil {
 						t.Errorf("append: %v", err)
 					}
 				})
 			}
 			close(start)
 			wg.Wait()
-			snap, err := l.LoadHead(context.Background())
+			snap, err := lg.LoadHead(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -313,7 +313,7 @@ func TestConcurrentAppend(t *testing.T) {
 				t.Fatalf("head %d", snap.Revision())
 			}
 			seen := map[int]bool{}
-			err = l.Scan(context.Background(), snap, Range{1, int64(n)}, func(r Record[int]) error {
+			err = lg.Scan(context.Background(), snap, Range{1, int64(n)}, func(r Record[int]) error {
 				if seen[r.Value] {
 					t.Error("duplicate input")
 				}
@@ -329,23 +329,23 @@ func TestConcurrentAppend(t *testing.T) {
 
 func TestAppendToConflict(t *testing.T) {
 	s := newStore()
-	l := testLog[int](t, s)
-	base := build(t, l, 16)
-	winner, err := l.AppendTo(context.Background(), base, 16)
+	lg := testLog[int](t, s)
+	base := build(t, lg, 16)
+	winner, err := lg.AppendTo(context.Background(), base, 16)
 	if err != nil {
 		t.Fatal(err)
 	}
 	lists := s.lists
-	if _, err := l.AppendTo(context.Background(), base, 999); !errors.Is(err, ErrConflict) {
+	if _, err := lg.AppendTo(context.Background(), base, 999); !errors.Is(err, ErrConflict) {
 		t.Fatal(err)
 	}
 	if s.lists != lists {
 		t.Fatal("AppendTo listed")
 	}
-	if _, err := l.AppendTo(context.Background(), nil, 999); !errors.Is(err, ErrConflict) {
+	if _, err := lg.AppendTo(context.Background(), nil, 999); !errors.Is(err, ErrConflict) {
 		t.Fatal(err)
 	}
-	if err := l.Verify(context.Background(), winner); err != nil {
+	if err := lg.Verify(context.Background(), winner); err != nil {
 		t.Fatal(err)
 	}
 	if base.Revision() != 16 || len(base.commit.Frontier) != 1 || len(base.commit.Frontier[0].Refs) != 15 {
@@ -357,21 +357,21 @@ func TestAmbiguousSuccess(t *testing.T) {
 	for _, reported := range []error{errors.New("lost response"), ErrExists} {
 		t.Run(reported.Error(), func(t *testing.T) {
 			s := newStore()
-			l := testLog[int](t, s)
-			build(t, l, 16)
+			lg := testLog[int](t, s)
+			build(t, lg, 16)
 			s.after = func(string, []byte) error { return reported }
-			r, err := l.Append(context.Background(), 42)
+			r, err := lg.Append(context.Background(), 42)
 			if err != nil || r.Revision != 17 {
 				t.Fatalf("append: %v %v", r, err)
 			}
-			snap, err := l.LoadHead(context.Background())
+			snap, err := lg.LoadHead(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}
 			if snap.Revision() != 17 {
 				t.Fatal("duplicate commit")
 			}
-			if err := l.Verify(context.Background(), snap); err != nil {
+			if err := lg.Verify(context.Background(), snap); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -385,8 +385,8 @@ func TestCrashAfterAggregate(t *testing.T) {
 	}
 	n := 1 << (4 * levels)
 	s := newStore()
-	l := testLog[int](t, s)
-	base := build(t, l, n)
+	lg := testLog[int](t, s)
+	base := build(t, lg, n)
 	original := make(map[string][]byte, len(s.objects))
 	for k, v := range s.objects {
 		original[k] = v
@@ -408,22 +408,22 @@ func TestCrashAfterAggregate(t *testing.T) {
 				}
 				return nil
 			}
-			if _, err := l.AppendTo(context.Background(), base, n); !errors.Is(err, failure) {
+			if _, err := lg.AppendTo(context.Background(), base, n); !errors.Is(err, failure) {
 				t.Fatalf("fault: %v", err)
 			}
-			head, err := l.LoadHead(context.Background())
+			head, err := lg.LoadHead(context.Background())
 			if err != nil || head.Revision() != int64(n) {
 				t.Fatalf("published incomplete commit: %v", err)
 			}
-			if err := l.Verify(context.Background(), head); err != nil {
+			if err := lg.Verify(context.Background(), head); err != nil {
 				t.Fatal(err)
 			}
 			s.before = nil
-			next, err := l.AppendTo(context.Background(), base, n)
+			next, err := lg.AppendTo(context.Background(), base, n)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := l.Verify(context.Background(), next); err != nil {
+			if err := lg.Verify(context.Background(), next); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -432,10 +432,10 @@ func TestCrashAfterAggregate(t *testing.T) {
 
 func TestRangesAndPruning(t *testing.T) {
 	s := newStore()
-	l := testLog[int](t, s)
-	snap := build(t, l, 513)
+	lg := testLog[int](t, s)
+	snap := build(t, lg, 513)
 	// All and open-ended ranges must stop at snap even when newer records exist.
-	if _, err := l.AppendTo(context.Background(), snap, 513); err != nil {
+	if _, err := lg.AppendTo(context.Background(), snap, 513); err != nil {
 		t.Fatal(err)
 	}
 	for _, r := range []Range{
@@ -447,7 +447,7 @@ func TestRangesAndPruning(t *testing.T) {
 		beforeLists, beforeCreates := s.lists, s.creates
 		s.getKeys = nil
 		var got []int64
-		if err := l.Scan(context.Background(), snap, r, func(v Record[int]) error { got = append(got, v.Revision); return nil }); err != nil {
+		if err := lg.Scan(context.Background(), snap, r, func(v Record[int]) error { got = append(got, v.Revision); return nil }); err != nil {
 			t.Fatal(err)
 		}
 		last := min(r.Last, snap.Revision())
@@ -485,27 +485,27 @@ func TestRangesAndPruning(t *testing.T) {
 		}
 	}
 	for _, r := range []Range{{1, 0}, {0, 513}, {-1, 1}, {1, -1}, {2, 1}, {math.MinInt64, math.MaxInt64}, {math.MaxInt64, math.MaxInt64}} {
-		if err := l.Scan(context.Background(), snap, r, func(Record[int]) error { return nil }); !errors.Is(err, ErrRange) {
+		if err := lg.Scan(context.Background(), snap, r, func(Record[int]) error { return nil }); !errors.Is(err, ErrRange) {
 			t.Fatal(err)
 		}
 	}
 	stop := errors.New("stop")
 	s.getKeys = nil
 	calls := 0
-	if err := l.Scan(context.Background(), snap, Range{1, 513}, func(Record[int]) error { calls++; return stop }); !errors.Is(err, stop) || calls != 1 || len(s.getKeys) != 2 {
+	if err := lg.Scan(context.Background(), snap, Range{1, 513}, func(Record[int]) error { calls++; return stop }); !errors.Is(err, stop) || calls != 1 || len(s.getKeys) != 2 {
 		t.Fatalf("early stop: %d %d %v", calls, len(s.getKeys), err)
 	}
 }
 
 func TestRangeHelpersEmptyAndInvalid(t *testing.T) {
 	s := newStore()
-	l := testLog[int](t, s)
+	lg := testLog[int](t, s)
 	ctx := context.Background()
-	first := build(t, l, 1)
+	first := build(t, lg, 1)
 	for _, snap := range []*Snapshot[int]{nil, first} {
 		for _, r := range []Range{{}, After(MaxRevision), After(1), StartingAt(2)} {
 			before := s.gets + s.lists + s.creates
-			if err := l.Scan(ctx, snap, r, func(Record[int]) error {
+			if err := lg.Scan(ctx, snap, r, func(Record[int]) error {
 				t.Fatalf("empty scan %+v yielded a record", r)
 				return nil
 			}); err != nil {
@@ -521,7 +521,7 @@ func TestRangeHelpersEmptyAndInvalid(t *testing.T) {
 			After(math.MinInt64), After(-1), After(MaxRevision + 1), After(math.MaxInt64),
 		} {
 			before := s.gets + s.lists + s.creates
-			if err := l.Scan(ctx, snap, r, func(Record[int]) error {
+			if err := lg.Scan(ctx, snap, r, func(Record[int]) error {
 				t.Fatal("invalid range yielded a record")
 				return nil
 			}); !errors.Is(err, ErrRange) {
@@ -541,36 +541,36 @@ func TestConfiguration(t *testing.T) {
 			t.Fatalf("accepted %+v", cfg)
 		}
 	}
-	l, err := Open[int](Config{Store: newStore(), Prefix: "/some/path/"})
+	lg, err := Open[int](Config{Store: newStore(), Prefix: "/some/path/"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l.logKey(1) != "some/path/v1/log/7ffffffffffffffe.json" {
-		t.Fatal(l.logKey(1))
+	if lg.logKey(1) != "some/path/v1/log/7ffffffffffffffe.json" {
+		t.Fatal(lg.logKey(1))
 	}
-	if _, err := l.Append(context.Background(), 1); err != nil {
+	if _, err := lg.Append(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
-	other := testLog[int](t, l.store)
-	s, err := l.LoadHead(context.Background())
+	other := testLog[int](t, lg.store)
+	s, err := lg.LoadHead(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := other.AppendTo(context.Background(), s, 2); err == nil {
 		t.Fatal("foreign snapshot accepted")
 	}
-	if _, err := l.AppendTo(context.Background(), new(Snapshot[int]), 2); err == nil {
+	if _, err := lg.AppendTo(context.Background(), new(Snapshot[int]), 2); err == nil {
 		t.Fatal("uninitialized snapshot accepted")
 	}
 }
 
 func TestLimits(t *testing.T) {
 	s := newStore()
-	l, err := Open[string](Config{Store: s, MaxEventBytes: 8, MaxObjectBytes: 1000})
+	lg, err := Open[string](Config{Store: s, MaxEventBytes: 8, MaxObjectBytes: 1000})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := l.Append(context.Background(), "1234567"); !errors.Is(err, ErrTooLarge) {
+	if _, err := lg.Append(context.Background(), "1234567"); !errors.Is(err, ErrTooLarge) {
 		t.Fatal(err)
 	}
 	if s.creates+s.gets+s.lists != 0 {
@@ -586,42 +586,42 @@ func TestLimits(t *testing.T) {
 	if s.creates != 0 {
 		t.Fatal("oversize commit was uploaded")
 	}
-	s.objects[l.logKey(1)] = bytes.Repeat([]byte("x"), 1001)
-	if _, err := l.LoadHead(context.Background()); !errors.Is(err, ErrTooLarge) || !errors.Is(err, ErrCorrupt) {
+	s.objects[lg.logKey(1)] = bytes.Repeat([]byte("x"), 1001)
+	if _, err := lg.LoadHead(context.Background()); !errors.Is(err, ErrTooLarge) || !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
 }
 
 func TestCancellation(t *testing.T) {
 	s := newStore()
-	l := testLog[int](t, s)
-	base := build(t, l, 16)
+	lg := testLog[int](t, s)
+	base := build(t, lg, 16)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := l.Append(ctx, 16); !errors.Is(err, context.Canceled) {
+	if _, err := lg.Append(ctx, 16); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	if _, err := l.AppendTo(ctx, base, 16); !errors.Is(err, context.Canceled) {
+	if _, err := lg.AppendTo(ctx, base, 16); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	if _, err := l.LoadHead(ctx); !errors.Is(err, context.Canceled) {
+	if _, err := lg.LoadHead(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	if err := l.Verify(ctx, base); !errors.Is(err, context.Canceled) {
+	if err := lg.Verify(ctx, base); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	ctx, cancel = context.WithCancel(context.Background())
 	calls := 0
-	err := l.Scan(ctx, base, Range{1, 16}, func(Record[int]) error { calls++; cancel(); return nil })
+	err := lg.Scan(ctx, base, Range{1, 16}, func(Record[int]) error { calls++; cancel(); return nil })
 	if !errors.Is(err, context.Canceled) || calls != 1 {
 		t.Fatal(err, calls)
 	}
 }
 
 func TestExhaustion(t *testing.T) {
-	l := testLog[int](t, newStore())
-	s := &Snapshot[int]{owner: l, commit: &commit{}, record: Record[int]{Revision: MaxRevision}}
-	if _, err := l.AppendTo(context.Background(), s, 1); !errors.Is(err, ErrExhausted) {
+	lg := testLog[int](t, newStore())
+	s := &Snapshot[int]{owner: lg, commit: &commit{}, record: Record[int]{Revision: MaxRevision}}
+	if _, err := lg.AppendTo(context.Background(), s, 1); !errors.Is(err, ErrExhausted) {
 		t.Fatal(err)
 	}
 }
@@ -636,7 +636,7 @@ func (v *countingJSON) UnmarshalJSON(b []byte) error { return json.Unmarshal(b, 
 
 func TestMarshalOnceAcrossConflict(t *testing.T) {
 	s := newStore()
-	l := testLog[countingJSON](t, s)
+	lg := testLog[countingJSON](t, s)
 	var calls atomic.Int32
 	injected := false
 	s.before = func(key string, body []byte) error {
@@ -657,7 +657,7 @@ func TestMarshalOnceAcrossConflict(t *testing.T) {
 		s.mu.Unlock()
 		return ErrExists
 	}
-	r, err := l.Append(context.Background(), countingJSON{7, &calls})
+	r, err := lg.Append(context.Background(), countingJSON{7, &calls})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -676,31 +676,31 @@ func TestRecordHashVector(t *testing.T) {
 
 func TestInvalidRevisions(t *testing.T) {
 	s := newStore()
-	l := testLog[int](t, s)
+	lg := testLog[int](t, s)
 	ctx := context.Background()
 	var empty *Snapshot[int]
 	if empty.Revision() != 0 || empty.Record().Revision != 0 {
 		t.Fatal("empty snapshot must report the invalid zero revision")
 	}
 	for _, revision := range []int64{math.MinInt64, -1, 0, MaxRevision + 1, math.MaxInt64} {
-		if _, err := l.LoadRevision(ctx, revision); !errors.Is(err, ErrRange) {
+		if _, err := lg.LoadRevision(ctx, revision); !errors.Is(err, ErrRange) {
 			t.Fatalf("LoadRevision(%d): %v", revision, err)
 		}
-		if err := l.validateFrontier(nil, revision, zeroHash); !errors.Is(err, ErrCorrupt) {
+		if err := lg.validateFrontier(nil, revision, zeroHash); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("frontier revision %d: %v", revision, err)
 		}
-		invalid := &Snapshot[int]{owner: l, commit: &commit{}, record: Record[int]{Revision: revision}}
-		if _, err := l.AppendTo(ctx, invalid, 1); !errors.Is(err, ErrCorrupt) {
+		invalid := &Snapshot[int]{owner: lg, commit: &commit{}, record: Record[int]{Revision: revision}}
+		if _, err := lg.AppendTo(ctx, invalid, 1); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("AppendTo revision %d: %v", revision, err)
 		}
-		if err := l.Verify(ctx, invalid); !errors.Is(err, ErrCorrupt) {
+		if err := lg.Verify(ctx, invalid); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("Verify revision %d: %v", revision, err)
 		}
 	}
 	if s.creates+s.gets+s.lists != 0 {
 		t.Fatal("invalid revisions performed store I/O")
 	}
-	first, err := l.AppendTo(ctx, nil, 42)
+	first, err := lg.AppendTo(ctx, nil, 42)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -709,7 +709,7 @@ func TestInvalidRevisions(t *testing.T) {
 	}
 	before := s.creates + s.gets + s.lists
 	for _, r := range []Range{{0, 1}, {-1, 1}, {1, 0}, {1, -1}, {math.MinInt64, 1}, {1, MaxRevision + 1}, {MaxRevision + 1, MaxRevision + 1}} {
-		if err := l.Scan(ctx, first, r, func(Record[int]) error { t.Fatal("invalid range yielded a record"); return nil }); !errors.Is(err, ErrRange) {
+		if err := lg.Scan(ctx, first, r, func(Record[int]) error { t.Fatal("invalid range yielded a record"); return nil }); !errors.Is(err, ErrRange) {
 			t.Fatalf("Scan(%+v): %v", r, err)
 		}
 	}
@@ -722,17 +722,17 @@ func TestInvalidRevisions(t *testing.T) {
 		}
 		c := *first.commit
 		c.Revision = revision
-		if _, err := l.validateProjection(c.project()); !errors.Is(err, ErrCorrupt) {
+		if _, err := lg.validateProjection(c.project()); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("accepted record revision %q", revision)
 		}
-		ref := l.commitRef(first)
+		ref := lg.commitRef(first)
 		ref.Start, ref.End = revision, revision
-		if _, _, err := l.validateRef(ref); !errors.Is(err, ErrCorrupt) {
+		if _, _, err := lg.validateRef(ref); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("accepted reference revision %q", revision)
 		}
 	}
 	for _, key := range []string{"v1/log/7fffffffffffffff.json", "v1/log/7fdfffffffffffff.json", "v1/log/0000000000000000.json", "v1/log/8000000000000000.json", "v1/log/ffffffffffffffff.json"} {
-		if _, err := l.parseLogKey(key); !errors.Is(err, ErrCorrupt) {
+		if _, err := lg.parseLogKey(key); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("accepted key %q", key)
 		}
 	}
@@ -743,44 +743,44 @@ func TestFinalRevision(t *testing.T) {
 		t.Fatal("MaxRevision must equal JavaScript's Number.MAX_SAFE_INTEGER")
 	}
 	s := newStore()
-	l := testLog[int](t, s)
+	lg := testLog[int](t, s)
 	ctx := context.Background()
 	const revision int64 = MaxRevision - 1
 	c := commit{
 		Format:   commitFormat,
 		Revision: hexRevision(revision),
 		CommitID: strings.Repeat("0", 32),
-		Previous: &previous{l.logKey(revision - 1), zeroHash},
+		Previous: &previous{lg.logKey(revision - 1), zeroHash},
 		Event:    json.RawMessage("0"),
-		Frontier: syntheticFrontier(l, revision),
+		Frontier: syntheticFrontier(lg, revision),
 	}
 	c.RecordHash = recordHash(revision, c.CommitID, zeroHash, c.Event)
 	body, err := json.Marshal(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Create(ctx, l.logKey(revision), body); err != nil {
+	if err := s.Create(ctx, lg.logKey(revision), body); err != nil {
 		t.Fatal(err)
 	}
-	final, err := l.Append(ctx, 1)
+	final, err := lg.Append(ctx, 1)
 	if err != nil || final.Revision != MaxRevision {
 		t.Fatalf("final append: %+v, %v", final, err)
 	}
-	if l.logKey(final.Revision) != "v1/log/7fe0000000000000.json" {
+	if lg.logKey(final.Revision) != "v1/log/7fe0000000000000.json" {
 		t.Fatal("wrong final revision key")
 	}
-	snap, err := l.LoadHead(ctx)
+	snap, err := lg.LoadHead(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if snap.Revision() != MaxRevision {
 		t.Fatalf("head: %d", snap.Revision())
 	}
-	if start, end, err := l.validateRef(l.commitRef(snap)); err != nil || start != MaxRevision || end != MaxRevision {
+	if start, end, err := lg.validateRef(lg.commitRef(snap)); err != nil || start != MaxRevision || end != MaxRevision {
 		t.Fatalf("final reference: %d..%d: %v", start, end, err)
 	}
 	var got []Record[int]
-	if err := l.Scan(ctx, snap, Range{revision, MaxRevision}, func(r Record[int]) error { got = append(got, r); return nil }); err != nil {
+	if err := lg.Scan(ctx, snap, Range{revision, MaxRevision}, func(r Record[int]) error { got = append(got, r); return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 2 || got[0].Revision != revision || got[0].Value != 0 || got[1] != final {
@@ -796,7 +796,7 @@ func TestFinalRevision(t *testing.T) {
 	} {
 		before := s.gets + s.lists + s.creates
 		var got []Record[int]
-		if err := l.Scan(ctx, snap, tt.r, func(r Record[int]) error { got = append(got, r); return nil }); err != nil {
+		if err := lg.Scan(ctx, snap, tt.r, func(r Record[int]) error { got = append(got, r); return nil }); err != nil {
 			t.Fatal(err)
 		}
 		if !reflect.DeepEqual(got, tt.want) {
@@ -806,12 +806,12 @@ func TestFinalRevision(t *testing.T) {
 			t.Fatal("final-record or empty scan performed store I/O")
 		}
 	}
-	loaded, err := l.LoadRevision(ctx, MaxRevision)
+	loaded, err := lg.LoadRevision(ctx, MaxRevision)
 	if err != nil || loaded.Record() != final {
 		t.Fatalf("load final revision: %v", err)
 	}
 	before := s.creates + s.gets + s.lists
-	if err := l.Scan(ctx, snap, Range{MaxRevision, MaxRevision + 1}, func(Record[int]) error {
+	if err := lg.Scan(ctx, snap, Range{MaxRevision, MaxRevision + 1}, func(Record[int]) error {
 		t.Fatal("out-of-range scan yielded a record")
 		return nil
 	}); !errors.Is(err, ErrRange) {
@@ -821,10 +821,10 @@ func TestFinalRevision(t *testing.T) {
 		t.Fatal("out-of-range scan performed store I/O")
 	}
 	creates := s.creates
-	if _, err := l.Append(ctx, 2); !errors.Is(err, ErrExhausted) {
+	if _, err := lg.Append(ctx, 2); !errors.Is(err, ErrExhausted) {
 		t.Fatalf("Append beyond maximum: %v", err)
 	}
-	if _, err := l.AppendTo(ctx, snap, 2); !errors.Is(err, ErrExhausted) {
+	if _, err := lg.AppendTo(ctx, snap, 2); !errors.Is(err, ErrExhausted) {
 		t.Fatalf("AppendTo beyond maximum: %v", err)
 	}
 	if s.creates != creates {

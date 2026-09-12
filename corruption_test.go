@@ -19,10 +19,10 @@ import (
 
 func TestCorruptCommit(t *testing.T) {
 	s := newStore()
-	l := testLog[int](t, s)
-	snap := build(t, l, 17)
+	lg := testLog[int](t, s)
+	snap := build(t, lg, 17)
 	original := bytes.Clone(snap.body)
-	key := l.logKey(17)
+	key := lg.logKey(17)
 	tests := map[string]func(map[string]any){
 		"format":                  func(c map[string]any) { c["format"] = "unknown" },
 		"revision":                func(c map[string]any) { c["revision"] = hexRevision(18) },
@@ -31,7 +31,7 @@ func TestCorruptCommit(t *testing.T) {
 		"event":                   func(c map[string]any) { c["event"] = 99 },
 		"record hash":             func(c map[string]any) { c["record_hash"] = zeroHash },
 		"previous missing":        func(c map[string]any) { c["previous"] = nil },
-		"previous revision":       func(c map[string]any) { c["previous"].(map[string]any)["key"] = l.logKey(14) },
+		"previous revision":       func(c map[string]any) { c["previous"].(map[string]any)["key"] = lg.logKey(14) },
 		"previous hash":           func(c map[string]any) { c["previous"].(map[string]any)["record_hash"] = zeroHash },
 		"frontier missing":        func(c map[string]any) { c["frontier"] = []any{} },
 		"frontier null":           func(c map[string]any) { c["frontier"] = nil },
@@ -54,7 +54,7 @@ func TestCorruptCommit(t *testing.T) {
 			mutate(c)
 			b, _ := json.Marshal(c)
 			s.objects[key] = b
-			if _, err := l.LoadHead(context.Background()); !errors.Is(err, ErrCorrupt) {
+			if _, err := lg.LoadHead(context.Background()); !errors.Is(err, ErrCorrupt) {
 				t.Fatalf("accepted corruption: %v", err)
 			}
 		})
@@ -62,14 +62,14 @@ func TestCorruptCommit(t *testing.T) {
 	for name, b := range map[string][]byte{"malformed": []byte("{"), "trailing": append(bytes.Clone(original), []byte(" {}")...), "duplicate": append([]byte(`{"format":"bad",`), original[1:]...)} {
 		t.Run(name, func(t *testing.T) {
 			s.objects[key] = b
-			if _, err := l.LoadHead(context.Background()); !errors.Is(err, ErrCorrupt) {
+			if _, err := lg.LoadHead(context.Background()); !errors.Is(err, ErrCorrupt) {
 				t.Fatal(err)
 			}
 		})
 	}
 	s.objects[key] = original
-	s.objects[l.logPrefix()+"!shadow"] = []byte("{}")
-	if _, err := l.LoadHead(context.Background()); !errors.Is(err, ErrCorrupt) {
+	s.objects[lg.logPrefix()+"!shadow"] = []byte("{}")
+	if _, err := lg.LoadHead(context.Background()); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("shadow HEAD: %v", err)
 	}
 }
@@ -82,23 +82,23 @@ func TestMissingAndDigestCorruption(t *testing.T) {
 	for _, n := range []int{16, 17, 257} {
 		t.Run(fmt.Sprint(n), func(t *testing.T) {
 			s := newStore()
-			l := testLog[int](t, s)
-			snap := build(t, l, n)
+			lg := testLog[int](t, s)
+			snap := build(t, lg, n)
 			ref := snap.commit.Frontier[len(snap.commit.Frontier)-1].Refs[0]
 			original := s.objects[ref.Key]
 			delete(s.objects, ref.Key)
-			if err := l.Verify(context.Background(), snap); !errors.Is(err, ErrCorrupt) || !errors.Is(err, ErrNotFound) {
+			if err := lg.Verify(context.Background(), snap); !errors.Is(err, ErrCorrupt) || !errors.Is(err, ErrNotFound) {
 				t.Fatalf("missing: %v", err)
 			}
 			s.objects[ref.Key] = append(bytes.Clone(original), '!')
-			if err := l.Verify(context.Background(), snap); !errors.Is(err, ErrCorrupt) {
+			if err := lg.Verify(context.Background(), snap); !errors.Is(err, ErrCorrupt) {
 				t.Fatalf("digest: %v", err)
 			}
 		})
 	}
 	s := newStore()
-	l := testLog[int](t, s)
-	if _, err := l.LoadRevision(context.Background(), 123); !errors.Is(err, ErrNotFound) || errors.Is(err, ErrCorrupt) {
+	lg := testLog[int](t, s)
+	if _, err := lg.LoadRevision(context.Background(), 123); !errors.Is(err, ErrNotFound) || errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
 }
@@ -115,15 +115,15 @@ func compressTest(t testing.TB, raw []byte) []byte {
 
 func TestAggregateValidation(t *testing.T) {
 	s := newStore()
-	l := testLog[int](t, s)
-	snap := build(t, l, 257)
+	lg := testLog[int](t, s)
+	snap := build(t, lg, 257)
 	indexRef := snap.commit.Frontier[0].Refs[0]
-	node, err := l.decodeIndex(indexRef, s.objects[indexRef.Key])
+	node, err := lg.decodeIndex(indexRef, s.objects[indexRef.Key])
 	if err != nil {
 		t.Fatal(err)
 	}
 	segRef := node.Children[0]
-	raw, err := l.decompress(s.objects[segRef.Key])
+	raw, err := lg.decompress(s.objects[segRef.Key])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,8 +146,8 @@ func TestAggregateValidation(t *testing.T) {
 			b, _ := json.Marshal(seg)
 			ref := segRef
 			ref.SHA256 = digest(b)
-			ref.Key = l.treeKey(ref)
-			if _, err := l.decodeSegment(ref, compressTest(t, b)); !errors.Is(err, ErrCorrupt) {
+			ref.Key = lg.treeKey(ref)
+			if _, err := lg.decodeSegment(ref, compressTest(t, b)); !errors.Is(err, ErrCorrupt) {
 				t.Fatal(err)
 			}
 		})
@@ -167,8 +167,8 @@ func TestAggregateValidation(t *testing.T) {
 			b, _ := json.Marshal(n)
 			ref := indexRef
 			ref.SHA256 = digest(b)
-			ref.Key = l.treeKey(ref)
-			if _, err := l.decodeIndex(ref, b); !errors.Is(err, ErrCorrupt) {
+			ref.Key = lg.treeKey(ref)
+			if _, err := lg.decodeIndex(ref, b); !errors.Is(err, ErrCorrupt) {
 				t.Fatal(err)
 			}
 		})
@@ -177,35 +177,35 @@ func TestAggregateValidation(t *testing.T) {
 	b := append(bytes.Clone(raw), []byte(" {}")...)
 	ref := segRef
 	ref.SHA256 = digest(b)
-	ref.Key = l.treeKey(ref)
-	if _, err := l.decodeSegment(ref, compressTest(t, b)); !errors.Is(err, ErrCorrupt) {
+	ref.Key = lg.treeKey(ref)
+	if _, err := lg.decodeSegment(ref, compressTest(t, b)); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
 }
 
 func TestDecompressionLimits(t *testing.T) {
-	l, err := Open[int](Config{Store: newStore(), MaxEventBytes: 1024, MaxObjectBytes: 4096})
+	lg, err := Open[int](Config{Store: newStore(), MaxEventBytes: 1024, MaxObjectBytes: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}
 	valid := compressTest(t, []byte(`{"ok":true}`))
-	if raw, err := l.decompress(valid); err != nil || string(raw) != `{"ok":true}` {
+	if raw, err := lg.decompress(valid); err != nil || string(raw) != `{"ok":true}` {
 		t.Fatal(string(raw), err)
 	}
 	for name, b := range map[string][]byte{
 		"second frame": append(bytes.Clone(valid), valid...), "trailing byte": append(bytes.Clone(valid), 0), "truncated": valid[:len(valid)-1], "invalid": []byte("not zstd"),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := l.decompress(b); !errors.Is(err, ErrCorrupt) {
+			if _, err := lg.decompress(b); !errors.Is(err, ErrCorrupt) {
 				t.Fatal(err)
 			}
 		})
 	}
 	bomb := compressTest(t, bytes.Repeat([]byte("a"), 1<<20))
-	if _, err := l.decompress(bomb); !errors.Is(err, ErrTooLarge) || !errors.Is(err, ErrCorrupt) {
+	if _, err := lg.decompress(bomb); !errors.Is(err, ErrTooLarge) || !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
-	if _, err := l.decompress(bytes.Repeat([]byte("a"), 4097)); !errors.Is(err, ErrTooLarge) {
+	if _, err := lg.decompress(bytes.Repeat([]byte("a"), 4097)); !errors.Is(err, ErrTooLarge) {
 		t.Fatal(err)
 	}
 	// A streaming frame need not advertise its decompressed size.
@@ -220,14 +220,14 @@ func TestDecompressionLimits(t *testing.T) {
 	if err := enc.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := l.decompress(buf.Bytes()); !errors.Is(err, ErrTooLarge) {
+	if _, err := lg.decompress(buf.Bytes()); !errors.Is(err, ErrTooLarge) {
 		t.Fatal(err)
 	}
 }
 
 func TestFullWidthFrontier(t *testing.T) {
-	l := testLog[int](t, newStore())
-	frontier := syntheticFrontier(l, MaxRevision)
+	lg := testLog[int](t, newStore())
+	frontier := syntheticFrontier(lg, MaxRevision)
 	var count int
 	for _, f := range frontier {
 		count += len(f.Refs)
@@ -235,58 +235,58 @@ func TestFullWidthFrontier(t *testing.T) {
 	if count != 195 {
 		t.Fatalf("maximum frontier has %d references", count)
 	}
-	if err := l.validateFrontier(frontier, MaxRevision, zeroHash); err != nil {
+	if err := lg.validateFrontier(frontier, MaxRevision, zeroHash); err != nil {
 		t.Fatal(err)
 	}
 	reverse := append([]frontierLevel(nil), frontier...)
 	reverse[0], reverse[1] = reverse[1], reverse[0]
-	if err := l.validateFrontier(reverse, MaxRevision, zeroHash); !errors.Is(err, ErrCorrupt) {
+	if err := lg.validateFrontier(reverse, MaxRevision, zeroHash); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
 	bad := frontier[13].Refs[0]
 	bad.Start = hexRevision(MaxRevision)
 	bad.End = hexRevision(MaxRevision)
-	if _, _, err := l.validateRef(bad); !errors.Is(err, ErrCorrupt) {
+	if _, _, err := lg.validateRef(bad); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
 	// This aligned block would end at MaxRevision+1, outside the allowed range.
 	bad.Start = hexRevision(MaxRevision - (1 << 52) + 2)
-	if _, _, err := l.validateRef(bad); !errors.Is(err, ErrCorrupt) {
+	if _, _, err := lg.validateRef(bad); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("out-of-range aligned block: %v", err)
 	}
 }
 
 func TestRevisionBeyondMaximum(t *testing.T) {
 	s := newStore()
-	l := testLog[int](t, s)
+	lg := testLog[int](t, s)
 	const revision = MaxRevision + 1
 	c := commit{
 		Format:   commitFormat,
 		Revision: hexRevision(revision),
 		CommitID: strings.Repeat("0", 32),
-		Previous: &previous{l.logKey(revision - 1), zeroHash},
+		Previous: &previous{lg.logKey(revision - 1), zeroHash},
 		Event:    json.RawMessage("0"),
-		Frontier: syntheticFrontier(l, revision),
+		Frontier: syntheticFrontier(lg, revision),
 	}
 	c.RecordHash = recordHash(revision, c.CommitID, zeroHash, c.Event)
 	// The hash and frontier are otherwise valid, so each validator must reject
 	// the revision itself even though it still fits in an int64.
-	if _, err := l.validateProjection(c.project()); !errors.Is(err, ErrCorrupt) {
+	if _, err := lg.validateProjection(c.project()); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("out-of-range record: %v", err)
 	}
-	if err := l.validateFrontier(c.Frontier, revision, zeroHash); !errors.Is(err, ErrCorrupt) {
+	if err := lg.validateFrontier(c.Frontier, revision, zeroHash); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("out-of-range frontier: %v", err)
 	}
 	body, err := json.Marshal(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := l.logKey(revision) // Deliberately encode an invalid revision.
-	if _, err := l.decodeCommit(key, body); !errors.Is(err, ErrCorrupt) {
+	key := lg.logKey(revision) // Deliberately encode an invalid revision.
+	if _, err := lg.decodeCommit(key, body); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("out-of-range commit: %v", err)
 	}
 	s.objects[key] = body
-	if _, err := l.LoadHead(context.Background()); !errors.Is(err, ErrCorrupt) {
+	if _, err := lg.LoadHead(context.Background()); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("out-of-range head: %v", err)
 	}
 	if s.gets != 0 {
@@ -296,7 +296,7 @@ func TestRevisionBeyondMaximum(t *testing.T) {
 
 // syntheticFrontier builds metadata for boundary tests without storing the
 // referenced history. Tests only fetch the real records appended after this root.
-func syntheticFrontier(l *Log[int], revision int64) []frontierLevel {
+func syntheticFrontier(lg *Log[int], revision int64) []frontierLevel {
 	var levels [16][]objectRef
 	next := int64(1)
 	for level := 15; level >= 0; level-- {
@@ -304,9 +304,9 @@ func syntheticFrontier(l *Log[int], revision int64) []frontierLevel {
 		for i := int64(0); i < ((revision-1)>>(4*level))&15; i++ {
 			ref := objectRef{uint8(level), hexRevision(next), hexRevision(next + (size - 1)), "", zeroHash, zeroHash, zeroHash}
 			if level == 0 {
-				ref.Key = l.logKey(next)
+				ref.Key = lg.logKey(next)
 			} else {
-				ref.Key = l.treeKey(ref)
+				ref.Key = lg.treeKey(ref)
 			}
 			levels[level] = append(levels[level], ref)
 			next += size
@@ -337,14 +337,14 @@ func (s *blockingGetStore) Get(ctx context.Context, key string) ([]byte, error) 
 
 func TestBoundedGETCancellation(t *testing.T) {
 	s := newStore()
-	l := testLog[int](t, s)
-	base := build(t, l, 16)
+	lg := testLog[int](t, s)
+	base := build(t, lg, 16)
 	blocked := &blockingGetStore{Store: s, started: make(chan struct{}, 16)}
-	l.store = blocked
+	lg.store = blocked
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { _, err := l.AppendTo(ctx, base, 16); done <- err }()
+	go func() { _, err := lg.AppendTo(ctx, base, 16); done <- err }()
 	for i := 0; i < 4; i++ {
 		select {
 		case <-blocked.started:
@@ -375,32 +375,32 @@ func TestBoundedGETCancellation(t *testing.T) {
 func TestCreateFailureAndInvisibility(t *testing.T) {
 	failure := errors.New("permanent backend failure")
 	s := newStore()
-	l := testLog[int](t, s)
+	lg := testLog[int](t, s)
 	s.before = func(string, []byte) error { return failure }
-	if _, err := l.Append(context.Background(), 1); !errors.Is(err, failure) {
+	if _, err := lg.Append(context.Background(), 1); !errors.Is(err, failure) {
 		t.Fatal(err)
 	}
 	if s.creates != 1 {
 		t.Fatal("retried an unclassified error")
 	}
 	s.before = func(string, []byte) error { return ErrExists }
-	if _, err := l.Append(context.Background(), 1); !errors.Is(err, ErrCorrupt) {
+	if _, err := lg.Append(context.Background(), 1); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
 }
 
 func TestSnapshotValueMutation(t *testing.T) {
-	l := testLog[map[string]int](t, newStore())
-	s, err := l.AppendTo(context.Background(), nil, map[string]int{"x": 1})
+	lg := testLog[map[string]int](t, newStore())
+	s, err := lg.AppendTo(context.Background(), nil, map[string]int{"x": 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.Record().Value["x"] = 99
-	next, err := l.AppendTo(context.Background(), s, map[string]int{"x": 2})
+	next, err := lg.AppendTo(context.Background(), s, map[string]int{"x": 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = l.Scan(context.Background(), next, Range{1, 2}, func(r Record[map[string]int]) error {
+	err = lg.Scan(context.Background(), next, Range{1, 2}, func(r Record[map[string]int]) error {
 		if r.Value["x"] != int(r.Revision) {
 			t.Fatal("snapshot mutation changed wire data")
 		}
@@ -412,13 +412,13 @@ func TestSnapshotValueMutation(t *testing.T) {
 }
 
 func TestRequiredGenesisFields(t *testing.T) {
-	l := testLog[int](t, newStore())
-	s := build(t, l, 1)
+	lg := testLog[int](t, newStore())
+	s := build(t, lg, 1)
 	for _, part := range []string{`"previous":null,`, `"event":0,`, `"frontier":[]`} {
 		body := strings.Replace(string(s.body), part, "", 1)
 		// Removing the final field needs its preceding comma removed as well.
 		body = strings.Replace(body, ",}", "}", 1)
-		if _, err := l.decodeCommit(l.logKey(1), []byte(body)); !errors.Is(err, ErrCorrupt) {
+		if _, err := lg.decodeCommit(lg.logKey(1), []byte(body)); !errors.Is(err, ErrCorrupt) {
 			t.Fatal(err)
 		}
 	}
@@ -431,16 +431,16 @@ type failedCodec int
 func (failedCodec) MarshalJSON() ([]byte, error) { return nil, privateCodecFailure }
 
 func TestCodecErrorRedaction(t *testing.T) {
-	l := testLog[failedCodec](t, newStore())
-	_, err := l.Append(context.Background(), 0)
+	lg := testLog[failedCodec](t, newStore())
+	_, err := lg.Append(context.Background(), 0)
 	if !errors.Is(err, privateCodecFailure) || strings.Contains(err.Error(), "private payload") {
 		t.Fatal(err)
 	}
 }
 
 func TestEventBytesAndCaseAliases(t *testing.T) {
-	l := testLog[string](t, newStore())
-	s, err := l.AppendTo(context.Background(), nil, "safe")
+	lg := testLog[string](t, newStore())
+	s, err := lg.AppendTo(context.Background(), nil, "safe")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -451,41 +451,41 @@ func TestEventBytesAndCaseAliases(t *testing.T) {
 		// Build the noncanonical envelope without RawMessage marshaling normalizing it.
 		b := bytes.Replace(s.body, []byte(`"safe"`), event, 1)
 		b = bytes.Replace(b, []byte(s.commit.RecordHash), []byte(c.RecordHash), 1)
-		if _, err := l.decodeCommit(l.logKey(1), b); !errors.Is(err, ErrCorrupt) {
+		if _, err := lg.decodeCommit(lg.logKey(1), b); !errors.Is(err, ErrCorrupt) {
 			t.Fatal(err)
 		}
 	}
 	b := append([]byte(`{"Format":"lokv/commit/v1",`), s.body[1:]...)
-	if _, err := l.decodeCommit(l.logKey(1), b); !errors.Is(err, ErrCorrupt) {
+	if _, err := lg.decodeCommit(lg.logKey(1), b); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
 	b = append([]byte(`{"future_field":{"any":"value"},`), s.body[1:]...)
-	if _, err := l.decodeCommit(l.logKey(1), b); err != nil {
+	if _, err := lg.decodeCommit(lg.logKey(1), b); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestAggregateEventLimit(t *testing.T) {
 	s := newStore()
-	l, err := Open[string](Config{Store: s, MaxEventBytes: 2000, MaxObjectBytes: 16000})
+	lg, err := Open[string](Config{Store: s, MaxEventBytes: 2000, MaxObjectBytes: 16000})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var snap *Snapshot[string]
 	for i := 0; i < 16; i++ {
-		snap, err = l.AppendTo(context.Background(), snap, strings.Repeat("x", 1500))
+		snap, err = lg.AppendTo(context.Background(), snap, strings.Repeat("x", 1500))
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
 	creates := s.creates
-	if _, err := l.AppendTo(context.Background(), snap, "next"); !errors.Is(err, ErrTooLarge) {
+	if _, err := lg.AppendTo(context.Background(), snap, "next"); !errors.Is(err, ErrTooLarge) {
 		t.Fatal(err)
 	}
 	if s.creates != creates {
 		t.Fatal("oversized segment was uploaded")
 	}
-	head, err := l.LoadHead(context.Background())
+	head, err := lg.LoadHead(context.Background())
 	if err != nil || head.Revision() != 16 {
 		t.Fatal(err)
 	}

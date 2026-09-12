@@ -152,20 +152,20 @@ func TestHTTPStoreConformance(t *testing.T) {
 func TestHTTPHeadAndCarries(t *testing.T) {
 	api := newAPI()
 	store := httpStore(t, api)
-	l, err := lokv.Open[int](lokv.Config{Store: store, Prefix: "log"})
+	lg, err := lokv.Open[int](lokv.Config{Store: store, Prefix: "log"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 17; i++ {
-		if _, err := l.Append(context.Background(), i); err != nil {
+		if _, err := lg.Append(context.Background(), i); err != nil {
 			t.Fatal(err)
 		}
 	}
-	snap, err := l.LoadHead(context.Background())
+	snap, err := lg.LoadHead(context.Background())
 	if err != nil || snap.Revision() != 17 {
 		t.Fatalf("head: %v", err)
 	}
-	if err := l.Verify(context.Background(), snap); err != nil {
+	if err := lg.Verify(context.Background(), snap); err != nil {
 		t.Fatal(err)
 	}
 	api.mu.Lock()

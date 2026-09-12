@@ -45,12 +45,12 @@ func TestLiveS3(t *testing.T) {
 	prefix := "lokv-integration/" + hex.EncodeToString(id[:]) + "/"
 	t.Logf("permanent test objects: s3://%s/%s", bucket, prefix)
 	storetest.Test(t, store, prefix+"store/")
-	l, err := lokv.Open[int](lokv.Config{Store: store, Prefix: prefix + "log"})
+	lg, err := lokv.Open[int](lokv.Config{Store: store, Prefix: prefix + "log"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 17; i++ {
-		r, err := l.Append(ctx, i)
+		r, err := lg.Append(ctx, i)
 		if err != nil || r.Revision != int64(i+1) {
 			t.Fatalf("append %d: %v", i, err)
 		}
@@ -62,11 +62,11 @@ func TestLiveS3(t *testing.T) {
 	if err := store.Create(ctx, keys[0], []byte("overwrite")); !errors.Is(err, lokv.ErrExists) {
 		t.Fatalf("conditional duplicate PUT: %v", err)
 	}
-	snap, err := l.LoadHead(ctx)
+	snap, err := lg.LoadHead(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := l.Verify(ctx, snap); err != nil {
+	if err := lg.Verify(ctx, snap); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -108,20 +108,20 @@ func parseRevision(s string) (int64, error) {
 	return r, nil
 }
 
-func corrupt(message string) error  { return fmt.Errorf("%w: %s", ErrCorrupt, message) }
-func digest(b []byte) string        { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
-func (l *Log[T]) logPrefix() string { return l.prefix + "v1/log/" }
+func corrupt(message string) error   { return fmt.Errorf("%w: %s", ErrCorrupt, message) }
+func digest(b []byte) string         { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
+func (lg *Log[T]) logPrefix() string { return lg.prefix + "v1/log/" }
 
 // logKey requires a revision in [1, MaxRevision], checked by callers.
-func (l *Log[T]) logKey(r int64) string {
-	return l.logPrefix() + hexRevision(math.MaxInt64-r) + ".json"
+func (lg *Log[T]) logKey(r int64) string {
+	return lg.logPrefix() + hexRevision(math.MaxInt64-r) + ".json"
 }
 
-func (l *Log[T]) parseLogKey(key string) (int64, error) {
-	if !strings.HasPrefix(key, l.logPrefix()) {
+func (lg *Log[T]) parseLogKey(key string) (int64, error) {
+	if !strings.HasPrefix(key, lg.logPrefix()) {
 		return 0, corrupt("foreign commit key")
 	}
-	s := strings.TrimPrefix(key, l.logPrefix())
+	s := strings.TrimPrefix(key, lg.logPrefix())
 	if len(s) != 21 || !strings.HasSuffix(s, ".json") {
 		return 0, corrupt("invalid commit key")
 	}
@@ -136,12 +136,12 @@ func (l *Log[T]) parseLogKey(key string) (int64, error) {
 	return r, nil
 }
 
-func (l *Log[T]) treeKey(ref objectRef) string {
+func (lg *Log[T]) treeKey(ref objectRef) string {
 	suffix := ".json"
 	if ref.Level == 1 {
 		suffix += ".zst"
 	}
-	return fmt.Sprintf("%sv1/tree/%x/%s-%s-%s%s", l.prefix, ref.Level, ref.Start, ref.End, ref.SHA256, suffix)
+	return fmt.Sprintf("%sv1/tree/%x/%s-%s-%s%s", lg.prefix, ref.Level, ref.Start, ref.End, ref.SHA256, suffix)
 }
 
 func recordHash(r int64, id, prev string, event []byte) string {
@@ -261,7 +261,7 @@ func requiredFields(b []byte, t reflect.Type) error {
 	return nil
 }
 
-func (l *Log[T]) validateProjection(p projection) (int64, error) {
+func (lg *Log[T]) validateProjection(p projection) (int64, error) {
 	r, err := parseRevision(p.Revision)
 	if err != nil {
 		return 0, err
@@ -272,7 +272,7 @@ func (l *Log[T]) validateProjection(p projection) (int64, error) {
 	if r == 1 && p.PreviousRecordHash != zeroHash {
 		return 0, corrupt("invalid genesis hash")
 	}
-	if int64(len(p.Event)) > l.maxEvent {
+	if int64(len(p.Event)) > lg.maxEvent {
 		return 0, fmt.Errorf("%w: %w: event", ErrCorrupt, ErrTooLarge)
 	}
 	// RawMessage marshaling compacts and HTML-escapes its input. Requiring an
@@ -288,7 +288,7 @@ func (l *Log[T]) validateProjection(p projection) (int64, error) {
 	return r, nil
 }
 
-func (l *Log[T]) validateRef(ref objectRef) (int64, int64, error) {
+func (lg *Log[T]) validateRef(ref objectRef) (int64, int64, error) {
 	if ref.Level > 15 {
 		return 0, 0, corrupt("invalid reference level")
 	}
@@ -307,9 +307,9 @@ func (l *Log[T]) validateRef(ref objectRef) (int64, int64, error) {
 	if !validHex(ref.SHA256, 64) || !validHex(ref.FirstPrevHash, 64) || !validHex(ref.LastRecordHash, 64) {
 		return 0, 0, corrupt("invalid reference digest")
 	}
-	key := l.treeKey(ref)
+	key := lg.treeKey(ref)
 	if ref.Level == 0 {
-		key = l.logKey(start)
+		key = lg.logKey(start)
 	}
 	if ref.Key != key {
 		return 0, 0, corrupt("reference key mismatch")
@@ -317,7 +317,7 @@ func (l *Log[T]) validateRef(ref objectRef) (int64, int64, error) {
 	return start, end, nil
 }
 
-func (l *Log[T]) validateFrontier(frontier []frontierLevel, revision int64, prevHash string) error {
+func (lg *Log[T]) validateFrontier(frontier []frontierLevel, revision int64, prevHash string) error {
 	if revision <= 0 || revision > MaxRevision {
 		return corrupt("revision out of range")
 	}
@@ -337,7 +337,7 @@ func (l *Log[T]) validateFrontier(frontier []frontierLevel, revision int64, prev
 			return corrupt("frontier digit mismatch")
 		}
 		for _, ref := range refs {
-			start, end, err := l.validateRef(ref)
+			start, end, err := lg.validateRef(ref)
 			if err != nil {
 				return err
 			}
@@ -353,11 +353,11 @@ func (l *Log[T]) validateFrontier(frontier []frontierLevel, revision int64, prev
 	return nil
 }
 
-func (l *Log[T]) decodeCommit(key string, body []byte) (*commit, error) {
-	if int64(len(body)) > l.maxObject {
+func (lg *Log[T]) decodeCommit(key string, body []byte) (*commit, error) {
+	if int64(len(body)) > lg.maxObject {
 		return nil, fmt.Errorf("%w: %w", ErrCorrupt, ErrTooLarge)
 	}
-	r, err := l.parseLogKey(key)
+	r, err := lg.parseLogKey(key)
 	if err != nil {
 		return nil, err
 	}
@@ -372,14 +372,14 @@ func (l *Log[T]) decodeCommit(key string, body []byte) (*commit, error) {
 		if c.Previous != nil {
 			return nil, corrupt("genesis has predecessor")
 		}
-	} else if c.Previous == nil || c.Previous.Key != l.logKey(r-1) {
+	} else if c.Previous == nil || c.Previous.Key != lg.logKey(r-1) {
 		return nil, corrupt("invalid predecessor key")
 	}
 	p := c.project()
-	if _, err := l.validateProjection(p); err != nil {
+	if _, err := lg.validateProjection(p); err != nil {
 		return nil, err
 	}
-	if err := l.validateFrontier(c.Frontier, r, p.PreviousRecordHash); err != nil {
+	if err := lg.validateFrontier(c.Frontier, r, p.PreviousRecordHash); err != nil {
 		return nil, err
 	}
 	return &c, nil

@@ -437,21 +437,21 @@ type Record[T any] struct {
 }
 
 // Head returns (zero, false, nil) for an empty log.
-func (l *Log[T]) Head(ctx context.Context) (_ Record[T], ok bool, _ error)
+func (lg *Log[T]) Head(ctx context.Context) (_ Record[T], ok bool, _ error)
 
 // Append marshals value once, discovers HEAD, and retries optimistic conflicts.
-func (l *Log[T]) Append(ctx context.Context, value T) (Record[T], error)
+func (lg *Log[T]) Append(ctx context.Context, value T) (Record[T], error)
 
 // Snapshot is an opaque loaded historical root. A nil Snapshot means empty.
 type Snapshot[T any] struct { /* exported accessors, private frontier */ }
 
-func (l *Log[T]) LoadHead(ctx context.Context) (*Snapshot[T], error)
-func (l *Log[T]) LoadRevision(ctx context.Context, revision int64) (*Snapshot[T], error)
+func (lg *Log[T]) LoadHead(ctx context.Context) (*Snapshot[T], error)
+func (lg *Log[T]) LoadRevision(ctx context.Context, revision int64) (*Snapshot[T], error)
 
 // AppendTo attempts exactly one successor of base. It returns ErrConflict if
 // another writer wins. This avoids an extra LIST/GET when a caller already owns
 // a fresh snapshot.
-func (l *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value T) (*Snapshot[T], error)
+func (lg *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value T) (*Snapshot[T], error)
 
 type Range struct {
     First int64 // inclusive, in [1, MaxRevision]
@@ -468,11 +468,11 @@ func After(revision int64) Range
 // It stops immediately on a callback error. Invalid bounds return ErrRange;
 // the zero Range is empty. Valid ranges on an empty snapshot or starting past
 // its head yield nothing.
-func (l *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range,
+func (lg *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range,
     yield func(Record[T]) error) error
 
 // Verify performs a full structural, digest, range, and record-chain scan.
-func (l *Log[T]) Verify(ctx context.Context, snap *Snapshot[T]) error
+func (lg *Log[T]) Verify(ctx context.Context, snap *Snapshot[T]) error
 
 var (
     ErrConflict   = errors.New("lokv: append conflict")

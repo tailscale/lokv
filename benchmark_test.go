@@ -10,14 +10,14 @@ import (
 
 func BenchmarkAppend(b *testing.B) {
 	s := newStore()
-	l := testLog[int](b, s)
+	lg := testLog[int](b, s)
 	var snap *Snapshot[int]
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		var err error
-		snap, err = l.AppendTo(ctx, snap, i)
+		snap, err = lg.AppendTo(ctx, snap, i)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -30,13 +30,13 @@ func BenchmarkAppend(b *testing.B) {
 
 func BenchmarkScan(b *testing.B) {
 	s := newStore()
-	l := testLog[int](b, s)
-	snap := build(b, l, 4097)
+	lg := testLog[int](b, s)
+	snap := build(b, lg, 4097)
 	s.gets = 0
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := l.Scan(context.Background(), snap, Range{1, 4097}, func(Record[int]) error { return nil }); err != nil {
+		if err := lg.Scan(context.Background(), snap, Range{1, 4097}, func(Record[int]) error { return nil }); err != nil {
 			b.Fatal(err)
 		}
 	}
