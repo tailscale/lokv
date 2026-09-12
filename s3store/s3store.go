@@ -1,0 +1,223 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
+// Package s3store adapts general-purpose Amazon S3 buckets to lokv.Store.
+// Every PUT uses If-None-Match: *. The bucket policy must deny deletes and
+// nonconditional writes, and lifecycle expiration must be disabled. Directory
+// buckets and eventually consistent or unordered S3-compatible services do not
+// satisfy the lokv storage contract.
+package s3store
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"io"
+	"net/netip"
+	"reflect"
+	"strings"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
+	"github.com/tailscale/lokv"
+)
+
+// Client is the subset of the AWS SDK v2 client required by this adapter.
+type Client interface {
+	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+}
+
+// Config contains backend settings; AWS credentials, region, and general
+// transport retry policy are configured on Client. MaxObjectBytes should match
+// or exceed lokv.Config.MaxObjectBytes.
+type Config struct {
+	Client             Client
+	Bucket             string
+	MaxObjectBytes     int64 // Default 64 MiB, maximum 256 MiB.
+	MaxConflictRetries int   // Retries HTTP 409 conditional conflicts; default 8.
+}
+
+// Store implements lokv.Store without update, delete, or multipart methods.
+type Store struct {
+	client    Client
+	bucket    string
+	maxObject int64
+	retries   int
+}
+
+var _ lokv.Store = (*Store)(nil)
+
+// New validates configuration without making a network request. Bucket must be
+// a general-purpose bucket name, not an ARN, URL, or directory bucket name.
+func New(cfg Config) (*Store, error) {
+	if cfg.Client == nil {
+		return nil, errors.New("s3store: nil client")
+	}
+	v := reflect.ValueOf(cfg.Client)
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Interface, reflect.Chan:
+		if v.IsNil() {
+			return nil, errors.New("s3store: nil client")
+		}
+	}
+	b := cfg.Bucket
+	if len(b) < 3 || len(b) > 63 || strings.HasSuffix(b, "--x-s3") || strings.Contains(b, "..") || b[0] == '.' || b[0] == '-' || b[len(b)-1] == '.' || b[len(b)-1] == '-' {
+		return nil, errors.New("s3store: invalid general-purpose bucket name")
+	}
+	if _, err := netip.ParseAddr(b); err == nil {
+		return nil, errors.New("s3store: bucket name cannot be an IP address")
+	}
+	for _, suffix := range []string{"-s3alias", "--ol-s3", "--table-s3"} {
+		if strings.HasSuffix(b, suffix) {
+			return nil, errors.New("s3store: bucket aliases are unsupported")
+		}
+	}
+	for _, c := range b {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '.' || c == '-') {
+			return nil, errors.New("s3store: invalid bucket name")
+		}
+	}
+	if cfg.MaxObjectBytes < 0 || cfg.MaxObjectBytes > 256<<20 || cfg.MaxConflictRetries < 0 {
+		return nil, errors.New("s3store: invalid limit")
+	}
+	if cfg.MaxObjectBytes == 0 {
+		cfg.MaxObjectBytes = 64 << 20
+	}
+	if cfg.MaxConflictRetries == 0 {
+		cfg.MaxConflictRetries = 8
+	}
+	return &Store{cfg.Client, b, cfg.MaxObjectBytes, cfg.MaxConflictRetries}, nil
+}
+
+func (s *Store) wrap(op, key string, err error) error {
+	return fmt.Errorf("s3store: %s bucket %s key %s: %w", op, s.bucket, key, err)
+}
+
+func status(err error) int {
+	var e interface{ HTTPStatusCode() int }
+	if errors.As(err, &e) {
+		return e.HTTPStatusCode()
+	}
+	return 0
+}
+
+func code(err error) string {
+	var e smithy.APIError
+	if errors.As(err, &e) {
+		return e.ErrorCode()
+	}
+	return ""
+}
+
+// List returns ascending keys. Requests of up to 1000 keys use one S3 request;
+// larger limits use continuation tokens while preserving global ordering.
+func (s *Store) List(ctx context.Context, prefix string, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, errors.New("s3store: LIST limit must be positive")
+	}
+	var keys []string
+	var token *string
+	for len(keys) < limit {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		n := min(limit-len(keys), 1000)
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(s.bucket), Prefix: aws.String(prefix), MaxKeys: aws.Int32(int32(n)), ContinuationToken: token})
+		if err != nil {
+			return nil, s.wrap("list", prefix, err)
+		}
+		if out == nil || len(out.Contents) > n {
+			return nil, s.wrap("list", prefix, lokv.ErrCorrupt)
+		}
+		for _, obj := range out.Contents {
+			if obj.Key == nil || !strings.HasPrefix(*obj.Key, prefix) || len(keys) > 0 && keys[len(keys)-1] >= *obj.Key {
+				return nil, s.wrap("unordered list", prefix, lokv.ErrCorrupt)
+			}
+			keys = append(keys, *obj.Key)
+		}
+		if !aws.ToBool(out.IsTruncated) || len(keys) == limit {
+			break
+		}
+		if len(out.Contents) == 0 || out.NextContinuationToken == nil || *out.NextContinuationToken == "" || token != nil && *token == *out.NextContinuationToken {
+			return nil, s.wrap("invalid pagination", prefix, lokv.ErrCorrupt)
+		}
+		token = out.NextContinuationToken
+	}
+	return keys, nil
+}
+
+// Get reads and closes a bounded response body, without trusting ContentLength.
+func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
+	if err != nil {
+		if status(err) == 404 || code(err) == "NoSuchKey" {
+			err = fmt.Errorf("%w: %w", lokv.ErrNotFound, err)
+		}
+		return nil, s.wrap("get", key, err)
+	}
+	if out == nil || out.Body == nil {
+		return nil, s.wrap("get", key, lokv.ErrCorrupt)
+	}
+	defer out.Body.Close()
+	if out.ContentLength != nil && *out.ContentLength > s.maxObject {
+		return nil, s.wrap("get", key, lokv.ErrTooLarge)
+	}
+	b, err := io.ReadAll(io.LimitReader(out.Body, s.maxObject+1))
+	if int64(len(b)) > s.maxObject {
+		return nil, s.wrap("get", key, lokv.ErrTooLarge)
+	}
+	if err != nil {
+		return nil, s.wrap("get", key, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// Create only performs conditional, single-request PUTs. HTTP 409 is retried
+// with bounded jitter; HTTP 412 maps to ErrExists. Other transport retries are
+// handled by the configured AWS SDK retryer.
+func (s *Store) Create(ctx context.Context, key string, value []byte) error {
+	if int64(len(value)) > s.maxObject {
+		return s.wrap("put", key, lokv.ErrTooLarge)
+	}
+	contentType := "application/json"
+	if strings.HasSuffix(key, ".zst") {
+		contentType = "application/zstd"
+	}
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		_, err := s.client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key), Body: bytes.NewReader(value), ContentLength: aws.Int64(int64(len(value))), ContentType: aws.String(contentType), IfNoneMatch: aws.String("*")})
+		if err == nil {
+			return nil
+		}
+		if status(err) == 412 || code(err) == "PreconditionFailed" {
+			return s.wrap("put", key, fmt.Errorf("%w: %w", lokv.ErrExists, err))
+		}
+		if status(err) != 409 && code(err) != "ConditionalRequestConflict" || attempt >= s.retries {
+			return s.wrap("put", key, err)
+		}
+		var jitter [1]byte
+		_, _ = rand.Read(jitter[:])
+		delay := (10 * time.Millisecond << min(attempt, 6)) * time.Duration(128+int(jitter[0])) / 256
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}

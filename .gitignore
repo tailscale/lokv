@@ -1,0 +1,18 @@
+# Copyright (c) Tailscale Inc & contributors
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Test binaries, coverage, and profiling output.
+*.test
+*.out
+*.prof
+/coverage/
+
+# Local editor and environment files.
+*~
+*.tmp
+.DS_Store
+.idea/
+.vscode/
+.env
+.envrc
+.direnv/

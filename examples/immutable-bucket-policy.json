@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyDeletesFromS3Log",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+      "Resource": "arn:aws:s3:::BUCKET/PREFIX/v1/*"
+    },
+    {
+      "Sid": "DenyNonConditionalS3LogCreation",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::BUCKET/PREFIX/v1/*",
+      "Condition": {
+        "Null": {"s3:if-none-match": "true"},
+        "Bool": {"s3:ObjectCreationOperation": "true"}
+      }
+    }
+  ]
+}
