@@ -221,6 +221,33 @@ Configuration and operation-specific rules are documented in the
 [Go reference](https://pkg.go.dev/github.com/tailscale/lokv). The storage protocol,
 key layout, compression, and hash definitions are in [DESIGN.md](DESIGN.md).
 
+## Local disk caching
+
+`cachestore` combines an authoritative store, such as the S3 store above, with
+a cache store. `diskstore` provides a persistent local filesystem store:
+
+```go
+cache, err := diskstore.New("/var/cache/myapp/audit-bucket")
+if err != nil { return err }
+cached, err := cachestore.New(cachestore.Config{
+    Origin: store,
+    Cache: cache,
+})
+if err != nil { return err }
+lg, err := lokv.Open[Event](lokv.Config{Store: cached, Prefix: "audit"})
+```
+
+Reads use cached immutable objects when available. Complete origin reads and
+successful origin writes fill the cache; cache lookup or fill failures do not
+fail successful origin operations. `List` always reaches the origin, so other
+writers remain visible. A warm cache can eliminate origin GETs for repeated
+scans and idle `State.Sync` calls, while each sync still makes an origin LIST.
+
+Give each origin its own cache directory. There is no automatic eviction;
+the cache is disposable and can be removed while clients are stopped. See the
+[cachestore documentation](https://pkg.go.dev/github.com/tailscale/lokv/cachestore)
+and its executable example for streaming, error handling, and ownership details.
+
 ## Validation
 
 ```sh
