@@ -7,9 +7,9 @@
 // the head with one limited LIST. A radix-16 frontier packs events once into zstd
 // segments, then builds reference-only index nodes.
 //
-// Revisions are int64 sequence numbers starting at 1. Nonpositive revisions are
-// invalid. Empty snapshots report zero, and appending after the maximum int64
-// revision returns ErrExhausted.
+// Revisions are int64 sequence numbers from 1 through [MaxRevision] (2^53 - 1,
+// JavaScript's Number.MAX_SAFE_INTEGER). Values outside that range are invalid.
+// Empty snapshots report zero, and appending after MaxRevision returns ErrExhausted.
 //
 // Conditional commit creation serializes cooperating writers. Hashes detect
 // corruption, not malicious authorized writers. Append retains an invocation ID
@@ -19,4 +19,9 @@
 // Snapshots are immutable historical roots. Loading validates the root locally;
 // Scan validates the objects it traverses, and Verify traverses the entire root.
 // Log methods may be called concurrently.
+//
+// The follow example for [Log.Scan] builds an in-memory index, then catches up
+// only new records after polling [Log.LoadHead]. Applications arrange their own
+// polling or notifications. [Log.AppendTo] can make a write conditional on the
+// snapshot used to build the index.
 package lokv

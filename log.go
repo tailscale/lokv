@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"reflect"
 	"strings"
 	"unicode"
@@ -18,6 +17,12 @@ import (
 )
 
 const safetyCeiling int64 = 256 << 20
+
+// MaxRevision is the maximum revision and maximum number of records in a log.
+// It equals JavaScript's Number.MAX_SAFE_INTEGER (9007199254740991), so all valid
+// revisions can pass through JavaScript Numbers without losing precision.
+// Appending to a log at MaxRevision returns ErrExhausted.
+const MaxRevision int64 = 1<<53 - 1
 
 // Config selects the immutable namespace and resource limits. Zero limits use
 // defaults. Prefix is normalized by stripping leading and trailing slashes.
@@ -90,7 +95,8 @@ type RecordHash [32]byte
 
 // Record is a decoded log event and its identity.
 type Record[T any] struct {
-	// Revision is the record's sequence number, starting at 1. Values <= 0 are invalid.
+	// Revision is the record's sequence number, from 1 through MaxRevision.
+	// Values <= 0 or > MaxRevision are invalid.
 	Revision   int64
 	CommitID   CommitID
 	Value      T
@@ -126,8 +132,8 @@ func (s *Snapshot[T]) Record() Record[T] {
 	return s.record
 }
 
-// Revision returns the root's positive revision, starting at 1. It returns zero
-// for an empty snapshot; zero is never a valid record revision.
+// Revision returns the root's revision, from 1 through [MaxRevision]. It returns
+// zero for an empty snapshot; zero is never a valid record revision.
 func (s *Snapshot[T]) Revision() int64 {
 	if s == nil {
 		return 0
@@ -171,8 +177,8 @@ func (l *Log[T]) checkSnapshot(s *Snapshot[T]) error {
 	if s != nil && (s.owner != l || s.commit == nil) {
 		return errors.New("lokv: snapshot belongs to a different log or is uninitialized")
 	}
-	if s != nil && s.Revision() <= 0 {
-		return corrupt("snapshot revision must be positive")
+	if s != nil && (s.Revision() <= 0 || s.Revision() > MaxRevision) {
+		return corrupt("snapshot revision out of range")
 	}
 	return nil
 }
@@ -194,8 +200,19 @@ func (l *Log[T]) get(ctx context.Context, key string, referenced bool) ([]byte, 
 	return b, nil
 }
 
-// LoadHead discovers the root using exactly one List with limit 1 and one Get.
-// An empty namespace returns nil. A malformed first key is never skipped.
+// LoadHead discovers the root using one List with limit 1, followed by one Get
+// for a nonempty namespace. An empty namespace returns nil without a Get.
+// A malformed first key is never skipped.
+//
+// To build an in-memory index, scan the returned snapshot with [All]. On later
+// polls, use [After] with the last successfully applied revision to scan through
+// the new snapshot's revision. Skip the scan if no revisions were added. See the
+// follow example for [Log.Scan].
+//
+// Every nonempty LoadHead call fetches the root, even if it has not changed.
+// Log does not provide notifications; callers arrange polling or wakeups. A
+// caller that already knows a committed revision can use [Log.LoadRevision]
+// to load that root with one Get and no List.
 func (l *Log[T]) LoadHead(ctx context.Context) (*Snapshot[T], error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -222,12 +239,18 @@ func (l *Log[T]) LoadHead(ctx context.Context) (*Snapshot[T], error) {
 
 // LoadRevision loads a historical root without listing. An absent requested
 // revision returns ErrNotFound; missing dependencies encountered later are corrupt.
-// Revisions start at 1; a revision <= 0 returns ErrRange without store I/O.
+// A revision outside [1, MaxRevision] returns ErrRange without store I/O.
+//
+// For frequent idle polling, probing the last applied revision plus 1 costs one
+// Get. ErrNotFound means no successor was visible at that lookup. Check for
+// [MaxRevision] before incrementing. If a successor exists, LoadHead can discover
+// the latest root for a batch catch-up, at the cost of an extra probe Get on
+// active polls. See the follow example for [Log.Scan].
 func (l *Log[T]) LoadRevision(ctx context.Context, revision int64) (*Snapshot[T], error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if revision <= 0 {
+	if revision <= 0 || revision > MaxRevision {
 		return nil, ErrRange
 	}
 	key := l.logKey(revision)
@@ -264,7 +287,7 @@ func (l *Log[T]) prepare(value T) (json.RawMessage, string, error) {
 }
 
 // Append marshals once and retries optimistic conflicts with the same commit ID.
-// The first record has revision 1. Appending after math.MaxInt64 returns ErrExhausted.
+// The first record has revision 1. Appending after [MaxRevision] returns ErrExhausted.
 // Transport retries belong to the adapter. An unresolved transport error is
 // returned, since the core cannot classify arbitrary backend errors as retryable.
 func (l *Log[T]) Append(ctx context.Context, value T) (Record[T], error) {
@@ -290,13 +313,22 @@ func (l *Log[T]) Append(ctx context.Context, value T) (Record[T], error) {
 	}
 }
 
-// AppendTo attempts exactly one successor of base. A nil base means the empty
-// root, whose successor has revision 1. It does not list, and returns ErrConflict
-// when another writer wins or ErrExhausted when base is already at math.MaxInt64.
+// AppendTo appends value only if base is still the current head when the commit
+// is created. A nil base means the log must still be empty; its successor has
+// revision 1. If another writer has advanced the log, AppendTo returns ErrConflict
+// without appending value. A base at [MaxRevision] returns ErrExhausted.
 //
-// Use AppendTo when the value depends on a snapshot you read: a conflict lets you
-// reload and recompute it. Append retries the same value automatically. Reusing
-// a snapshot also saves the head lookup required by Append.
+// Use AppendTo when choosing value depends on the log's state. For example,
+// scan a snapshot into an index of reserved names, check that a name is free,
+// then append its reservation against that same snapshot. On ErrConflict, catch
+// up and check again: another writer may have reserved the name. [Log.Append]
+// automatically retries the same value, so it cannot recheck that decision.
+// See the follow example for [Log.Scan] for maintaining such an index.
+//
+// AppendTo returns the new snapshot on success. A sequential writer can reuse
+// it as the next base. Reusing a loaded or returned snapshot avoids the List and
+// head Get performed by Append; carries may still read historical objects. Both
+// base and the returned snapshot remain immutable historical views.
 func (l *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value T) (*Snapshot[T], error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -304,7 +336,7 @@ func (l *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value T) (*Sna
 	if err := l.checkSnapshot(base); err != nil {
 		return nil, err
 	}
-	if base != nil && base.Revision() == math.MaxInt64 {
+	if base != nil && base.Revision() == MaxRevision {
 		return nil, ErrExhausted
 	}
 	event, id, err := l.prepare(value)
@@ -322,7 +354,7 @@ func (l *Log[T]) appendPrepared(ctx context.Context, base *Snapshot[T], event js
 	var prev *previous
 	frontier := make([]frontierLevel, 0)
 	if base != nil {
-		if base.Revision() == math.MaxInt64 {
+		if base.Revision() == MaxRevision {
 			return nil, ErrExhausted
 		}
 		revision = base.Revision() + 1

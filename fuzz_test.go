@@ -9,14 +9,14 @@ import (
 )
 
 func FuzzKeyParsing(f *testing.F) {
-	for _, s := range []string{"v1/log/7ffffffffffffffe.json", "v1/log/7fffffffffffffff.json", "v1/log/0000000000000000.json", "", "v1/log/FFFFFFFFFFFFFFFF.json"} {
+	for _, s := range []string{"v1/log/7ffffffffffffffe.json", "v1/log/7fffffffffffffff.json", "v1/log/7fe0000000000000.json", "v1/log/7fdfffffffffffff.json", "v1/log/0000000000000000.json", "", "v1/log/FFFFFFFFFFFFFFFF.json"} {
 		f.Add(s)
 	}
 	l := testLog[int](f, newStore())
 	f.Fuzz(func(t *testing.T, key string) {
 		r, err := l.parseLogKey(key)
-		if err == nil && l.logKey(r) != key {
-			t.Fatal("noncanonical key accepted")
+		if err == nil && (r <= 0 || r > MaxRevision || l.logKey(r) != key) {
+			t.Fatal("out-of-range or noncanonical key accepted")
 		}
 	})
 }
@@ -39,6 +39,8 @@ func FuzzFrontier(f *testing.F) {
 	f.Add(int64(-1), []byte("[]"))
 	f.Add(int64(0), []byte("[]"))
 	f.Add(int64(1), []byte("[]"))
+	f.Add(MaxRevision, []byte("[]"))
+	f.Add(MaxRevision+1, []byte("[]"))
 	f.Add(int64(17), []byte(`[ {"level":1,"refs":[]} ]`))
 	l := testLog[int](f, newStore())
 	f.Fuzz(func(t *testing.T, revision int64, b []byte) {

@@ -85,7 +85,7 @@ func validHex(s string, n int) (valid bool) {
 	return true
 }
 
-// parseHexInt64 also accepts zero, which is a valid reverse-encoded key suffix.
+// parseHexInt64 parses a fixed-width suffix before applying revision bounds.
 func parseHexInt64(s string) (int64, error) {
 	if !validHex(s, 16) {
 		return 0, corrupt("invalid revision")
@@ -102,8 +102,8 @@ func parseRevision(s string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if r <= 0 {
-		return 0, corrupt("revision must be positive")
+	if r <= 0 || r > MaxRevision {
+		return 0, corrupt("revision out of range")
 	}
 	return r, nil
 }
@@ -112,7 +112,7 @@ func corrupt(message string) error  { return fmt.Errorf("%w: %s", ErrCorrupt, me
 func digest(b []byte) string        { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 func (l *Log[T]) logPrefix() string { return l.prefix + "v1/log/" }
 
-// logKey requires a positive revision, checked by callers before encoding.
+// logKey requires a revision in [1, MaxRevision], checked by callers.
 func (l *Log[T]) logKey(r int64) string {
 	return l.logPrefix() + hexRevision(math.MaxInt64-r) + ".json"
 }
@@ -129,10 +129,11 @@ func (l *Log[T]) parseLogKey(key string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if r == math.MaxInt64 {
-		return 0, corrupt("commit key encodes revision zero")
+	r = math.MaxInt64 - r
+	if r <= 0 || r > MaxRevision {
+		return 0, corrupt("commit key encodes revision out of range")
 	}
-	return math.MaxInt64 - r, nil
+	return r, nil
 }
 
 func (l *Log[T]) treeKey(ref objectRef) string {
@@ -300,7 +301,7 @@ func (l *Log[T]) validateRef(ref objectRef) (int64, int64, error) {
 		return 0, 0, err
 	}
 	size := int64(1) << (4 * ref.Level)
-	if (start-1)%size != 0 || start > math.MaxInt64-(size-1) || end != start+(size-1) {
+	if (start-1)%size != 0 || start > MaxRevision-(size-1) || end != start+(size-1) {
 		return 0, 0, corrupt("invalid reference range")
 	}
 	if !validHex(ref.SHA256, 64) || !validHex(ref.FirstPrevHash, 64) || !validHex(ref.LastRecordHash, 64) {
@@ -317,8 +318,8 @@ func (l *Log[T]) validateRef(ref objectRef) (int64, int64, error) {
 }
 
 func (l *Log[T]) validateFrontier(frontier []frontierLevel, revision int64, prevHash string) error {
-	if revision <= 0 {
-		return corrupt("revision must be positive")
+	if revision <= 0 || revision > MaxRevision {
+		return corrupt("revision out of range")
 	}
 	var levels [16][]objectRef
 	last := -1

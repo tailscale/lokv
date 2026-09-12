@@ -10,8 +10,10 @@ SPDX-License-Identifier: BSD-3-Clause
 
 lokv implements an append-only log over a sorted, create-only key/value store
 (e.g. S3, if so configured). Values are JSON, revisions are gap-free `int64`s
-starting at **1**, and every commit is a historical snapshot. Nonpositive revisions
-are invalid.
+starting at **1**, and every commit is a historical snapshot. Revisions are capped
+at `lokv.MaxRevision` (**9,007,199,254,740,991**, or 2^53 - 1), JavaScript's
+`Number.MAX_SAFE_INTEGER`, so they remain exact when passed through JavaScript
+Numbers. Revisions outside `1..MaxRevision` are invalid.
 
 ```go
 import (
@@ -35,7 +37,7 @@ fmt.Println(record.Revision)
 
 snap, err := log.LoadHead(ctx)
 if err != nil { return err }
-err = log.Scan(ctx, snap, lokv.Range{First: 1, Last: snap.Revision()},
+err = log.Scan(ctx, snap, lokv.All(),
     func(r lokv.Record[string]) error {
         fmt.Println(r.Revision, r.Value)
         return nil
@@ -43,22 +45,107 @@ err = log.Scan(ctx, snap, lokv.Range{First: 1, Last: snap.Revision()},
 if err != nil { return err }
 ```
 
-`Head` returns `(record, found, error)`. `LoadHead` returns a nil snapshot for an
+`Head` returns `(record, ok, error)`. `LoadHead` returns a nil snapshot for an
 empty log. An empty snapshot reports revision 0, which is not a valid record
 revision. `LoadRevision` loads a historical snapshot without listing and rejects
-revisions <= 0 with `ErrRange`. Appending after `math.MaxInt64` returns `ErrExhausted`.
+revisions outside `1..MaxRevision` with `ErrRange`. Appending after `MaxRevision`
+returns `ErrExhausted`.
 `AppendTo(ctx, snapshot, value)` avoids head discovery and attempts one successor;
 a stale snapshot returns `ErrConflict`. Use it when choosing the next event depends
 on the history you just read, so you can reload and recompute on conflict.
 `Append` retries the same value automatically. Snapshots belong to the `Log` that
 loaded them. Their private wire state is unaffected by mutations to returned values.
 
-Ranges include both endpoints, must be positive, and must fit inside a nonempty
-snapshot; invalid ranges return `ErrRange`. `Scan`
-visits records in order and returns callback errors immediately. `Verify` scans
-all records and reachable tree objects; verifying an empty snapshot succeeds.
-Loading validates the root locally, while scans validate the objects they fetch.
-Verification does not inventory unreachable objects or superseded raw commits.
+Ranges include both endpoints, which must be within `1..MaxRevision`, with
+`First <= Last`; invalid bounds return `ErrRange`. The zero `Range` is empty.
+`Scan` visits the intersection of the range and snapshot: `lokv.All()` scans
+everything, and `lokv.StartingAt(rev)` scans from `rev` through the snapshot's end.
+`lokv.After(applied)` excludes the already-applied revision: `After(0)` covers the
+whole log, and `After(MaxRevision)` returns an empty range.
+
+Empty ranges, empty snapshots, and ranges starting past the head yield nothing,
+with no store I/O. Scans visit records in order and return callback errors
+immediately. `Verify` scans all records and reachable tree objects; verifying an
+empty snapshot succeeds. Loading validates the root locally, while scans validate
+the objects they fetch. Verification does not inventory unreachable objects or
+superseded raw commits.
+
+## Following the log with an in-memory index
+
+The executable [following example](example_follow_test.go) shows the complete
+pattern, also available as the follow example for `Log.Scan` in Go documentation:
+
+1. Start with an empty index and `applied = 0`.
+2. Call `LoadHead`, then `Scan` with `lokv.All()` to build the index.
+3. On each poll or wakeup, call `LoadHead` again. If its revision is greater than
+   `applied`, scan with `lokv.After(applied)` to apply only new records.
+4. Advance `applied` after each record is successfully applied. If a scan fails
+   partway through, the next attempt resumes after the last successful update.
+
+`After` handles both an empty index and a checkpoint at `MaxRevision` without
+caller-side arithmetic. A snapshot is a fixed upper bound: writes that arrive
+during a scan are picked up on the next catch-up. Scan yields only the requested
+records and performs no LIST operations.
+
+Without transport retries or an application-provided cache, the costs are:
+
+| Situation | Store operations |
+| --- | --- |
+| Poll an empty log | One LIST with limit 1 |
+| Poll an unchanged nonempty log | One LIST and one head GET; skip Scan |
+| Catch up exactly one new entry | One LIST and one head GET; Scan needs no further I/O |
+| Catch up several new entries | The head lookup, plus GETs for intersecting index nodes, segments, and raw tail commits |
+
+The head contains its own event, so Scan never fetches it again. Disjoint
+historical subtrees are skipped. A partially overlapping segment is fetched and
+validated in full, including any older entries it contains; only the new entries
+are applied. The core does not cache objects between calls.
+
+`Log` and `Store` have no watch API. Run the example's `catchUp` closure from one
+goroutine using a ticker, an application-provided wakeup channel, or both:
+
+```go
+ticker := time.NewTicker(time.Second)
+defer ticker.Stop()
+for {
+    if err := catchUp(); err != nil { return err }
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    case <-ticker.C:
+    case _, ok := <-wake: // optional <-chan struct{}; nil disables wakeups
+        if !ok { wake = nil }
+    }
+}
+```
+
+Treat external notifications, such as S3 notifications for committed log keys,
+as hints to catch up. Duplicate or coalesced hints work; a periodic poll covers
+missed hints. Synchronize access if other goroutines read the index. If applying
+a record can fail, leave the index unchanged on failure; if persisting the index,
+persist its last-applied revision together with its updates.
+
+For mostly idle logs, probing `LoadRevision(applied+1)` uses one GET and no LIST:
+`ErrNotFound` means no successor was visible at that lookup. Guard against
+`lokv.MaxRevision` before incrementing. If a successor exists, load the latest head
+to batch the catch-up; this trades an extra probe GET on active polls for cheaper
+idle polls. If a notification already provides a committed revision, use
+`LoadRevision` directly and scan up to that revision. A snapshot returned by a
+local `AppendTo` needs no lookup at all. All three approaches reuse the same
+last-applied revision and range-scan pattern.
+
+## Making decisions against an indexed snapshot
+
+`AppendTo` makes a write conditional on the snapshot used for the decision. For
+example, after catching up a name-reservation index, check that a name is free
+and call `AppendTo` with that exact snapshot. On `ErrConflict`, catch up and check
+again: another writer may have reserved the name in the meantime. `Append` retries
+the same value automatically and cannot recheck application-specific conditions.
+
+The [AppendTo example](example_follow_test.go) demonstrates that race. Keep the
+snapshot returned by a successful `AppendTo` for the next operation, and apply
+its record to your index before using that index for another decision. When a
+catch-up scan fails, finish catching up before making decisions against its head.
 
 ## Storage and concurrency
 

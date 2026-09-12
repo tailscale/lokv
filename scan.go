@@ -9,14 +9,58 @@ import (
 	"fmt"
 )
 
-// Range is an inclusive interval of revisions within a snapshot. Revisions start
-// at 1; First and Last must both be positive, with First <= Last.
+// Range is an inclusive interval of revisions. First and Last must both be in
+// [1, MaxRevision], with First <= Last. As a special case, the zero Range is
+// empty. [Log.Scan] visits the intersection of this range and its snapshot.
 type Range struct{ First, Last int64 }
 
-// Scan visits exactly the requested revisions in increasing order and stops
-// immediately on callback error. It validates each fetched object, including
-// complete segments that partially intersect the range. Disjoint subtrees are
-// skipped. Any range on an empty snapshot is invalid.
+// All returns the range [1, MaxRevision]. Use it with [Log.Scan] to visit every
+// record in a snapshot, including an empty snapshot.
+func All() Range { return Range{1, MaxRevision} }
+
+// StartingAt returns the range [revision, MaxRevision], including revision.
+// A revision outside [1, MaxRevision] produces an invalid range, which [Log.Scan]
+// rejects with ErrRange. Use [After] when the revision has already been applied.
+func StartingAt(revision int64) Range { return Range{revision, MaxRevision} }
+
+// After returns the range of revisions strictly greater than revision.
+// After(0) is equivalent to [All], and After(MaxRevision) returns an empty range.
+// A revision outside [0, MaxRevision] produces an invalid range, which [Log.Scan]
+// rejects with ErrRange. See the follow example for Log.Scan for using After to
+// catch up an in-memory index.
+func After(revision int64) Range {
+	if revision < 0 || revision > MaxRevision {
+		return StartingAt(revision) // Preserve invalid bounds without incrementing.
+	}
+	if revision == MaxRevision {
+		return Range{}
+	}
+	return StartingAt(revision + 1)
+}
+
+// Scan visits the records in both r and snap in increasing revision order,
+// stopping immediately on callback error. It returns ErrRange for invalid bounds:
+// First and Last must be in [1, MaxRevision], with First <= Last, except that
+// the zero Range is empty. An empty range, a valid range on an empty snapshot,
+// or one starting past the snapshot's revision yields nothing and performs no
+// store I/O. yield must be non-nil.
+//
+// Use [All] to scan the whole snapshot, [StartingAt] to include a revision, or
+// [After] to resume after an already-applied revision. Scan does not wait for
+// future records. It validates each fetched object, including complete segments
+// that partially intersect the range. Disjoint subtrees are skipped.
+//
+// The follow example shows an initial full scan into an in-memory index and
+// later catch-up scans. Keep the last successfully applied revision and scan
+// only the interval after it. Scan performs no List calls and does not refetch
+// the snapshot's own record: a range containing only that record needs no I/O.
+// Other reads are limited to intersecting index nodes, packed segments, and raw
+// tail commits. A segment is read and validated in full even when its first few
+// records were already applied; only requested records reach yield.
+//
+// Successfully yielded records are not rolled back if a later read or callback
+// fails. Advance an application's last-applied revision only after its update
+// succeeds, and keep it consistent with the application's index on retries.
 func (l *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield func(Record[T]) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -24,12 +68,16 @@ func (l *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range, yield fun
 	if err := l.checkSnapshot(snap); err != nil {
 		return err
 	}
-	if snap == nil || r.First <= 0 || r.Last <= 0 || r.First > r.Last || r.Last > snap.Revision() {
+	if r != (Range{}) && (r.First <= 0 || r.First > r.Last || r.Last > MaxRevision) {
 		return ErrRange
 	}
 	if yield == nil {
 		return errors.New("lokv: nil scan callback")
 	}
+	if r == (Range{}) || r.First > snap.Revision() {
+		return nil
+	}
+	r.Last = min(r.Last, snap.Revision())
 	if err := l.validateFrontier(snap.commit.Frontier, snap.Revision(), snap.commit.project().PreviousRecordHash); err != nil {
 		return err
 	}
@@ -138,5 +186,5 @@ func (l *Log[T]) Verify(ctx context.Context, snap *Snapshot[T]) error {
 	if snap == nil {
 		return nil
 	}
-	return l.Scan(ctx, snap, Range{1, snap.Revision()}, func(Record[T]) error { return nil })
+	return l.Scan(ctx, snap, All(), func(Record[T]) error { return nil })
 }

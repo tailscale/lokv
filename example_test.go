@@ -24,7 +24,7 @@ func Example() {
 			panic(err)
 		}
 	}
-	err = log.Scan(ctx, snapshot, lokv.Range{First: 1, Last: snapshot.Revision()}, func(record lokv.Record[string]) error {
+	err = log.Scan(ctx, snapshot, lokv.All(), func(record lokv.Record[string]) error {
 		fmt.Println(record.Revision, record.Value)
 		return nil
 	})

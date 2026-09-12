@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -228,32 +227,70 @@ func TestDecompressionLimits(t *testing.T) {
 
 func TestFullWidthFrontier(t *testing.T) {
 	l := testLog[int](t, newStore())
-	frontier := syntheticFrontier(l, math.MaxInt64)
+	frontier := syntheticFrontier(l, MaxRevision)
 	var count int
 	for _, f := range frontier {
 		count += len(f.Refs)
 	}
-	if count != 231 {
+	if count != 195 {
 		t.Fatalf("maximum frontier has %d references", count)
 	}
-	if err := l.validateFrontier(frontier, math.MaxInt64, zeroHash); err != nil {
+	if err := l.validateFrontier(frontier, MaxRevision, zeroHash); err != nil {
 		t.Fatal(err)
 	}
 	reverse := append([]frontierLevel(nil), frontier...)
 	reverse[0], reverse[1] = reverse[1], reverse[0]
-	if err := l.validateFrontier(reverse, math.MaxInt64, zeroHash); !errors.Is(err, ErrCorrupt) {
+	if err := l.validateFrontier(reverse, MaxRevision, zeroHash); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
-	bad := frontier[15].Refs[0]
-	bad.Start = hexRevision(math.MaxInt64)
-	bad.End = hexRevision(math.MaxInt64)
+	bad := frontier[13].Refs[0]
+	bad.Start = hexRevision(MaxRevision)
+	bad.End = hexRevision(MaxRevision)
 	if _, _, err := l.validateRef(bad); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
-	// This aligned block would end at MaxInt64+1. Reject before adding its size.
-	bad.Start = hexRevision(math.MaxInt64 - (1 << 60) + 2)
+	// This aligned block would end at MaxRevision+1, outside the allowed range.
+	bad.Start = hexRevision(MaxRevision - (1 << 52) + 2)
 	if _, _, err := l.validateRef(bad); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("overflowing aligned range: %v", err)
+		t.Fatalf("out-of-range aligned block: %v", err)
+	}
+}
+
+func TestRevisionBeyondMaximum(t *testing.T) {
+	s := newStore()
+	l := testLog[int](t, s)
+	const revision = MaxRevision + 1
+	c := commit{
+		Format:   commitFormat,
+		Revision: hexRevision(revision),
+		CommitID: strings.Repeat("0", 32),
+		Previous: &previous{l.logKey(revision - 1), zeroHash},
+		Event:    json.RawMessage("0"),
+		Frontier: syntheticFrontier(l, revision),
+	}
+	c.RecordHash = recordHash(revision, c.CommitID, zeroHash, c.Event)
+	// The hash and frontier are otherwise valid, so each validator must reject
+	// the revision itself even though it still fits in an int64.
+	if _, err := l.validateProjection(c.project()); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("out-of-range record: %v", err)
+	}
+	if err := l.validateFrontier(c.Frontier, revision, zeroHash); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("out-of-range frontier: %v", err)
+	}
+	body, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := l.logKey(revision) // Deliberately encode an invalid revision.
+	if _, err := l.decodeCommit(key, body); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("out-of-range commit: %v", err)
+	}
+	s.objects[key] = body
+	if _, err := l.LoadHead(context.Background()); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("out-of-range head: %v", err)
+	}
+	if s.gets != 0 {
+		t.Fatal("invalid head key triggered a Get")
 	}
 }
 

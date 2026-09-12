@@ -86,8 +86,11 @@ overwritten or deleted by this library.
 ## 4. Terminology and invariants
 
 `revision`
-: Positive `int64` sequence number. Revision 1 is the first record; revisions
-  <= 0 are invalid. Zero is reserved for empty-snapshot accessors.
+: `int64` sequence number from 1 through `MaxRevision` (9,007,199,254,740,991,
+  or 2^53 - 1). Revision 1 is the first record; values outside this range are
+  invalid. Zero is reserved for empty-snapshot accessors. The cap equals
+  JavaScript's `Number.MAX_SAFE_INTEGER` so revisions remain exact when passed
+  through JavaScript Numbers.
 
 `commit`
 : The immutable `v1/log/...json` object containing one event and the radix
@@ -120,8 +123,9 @@ Required invariants:
    them is created.
 10. The commit creation is conditional and is the append's linearization point.
 
-For an `int64` revision there are 16 frontier levels, numbered 0 through 15.
-Level 15 has at most 7 references, and the maximum frontier contains 231 references.
+With the `MaxRevision` cap there are 14 possible frontier levels, numbered 0
+through 13. Level 13 has at most 1 reference, and the maximum frontier contains
+195 references.
 This bounds commit metadata even though old commit objects are retained forever.
 
 ## 5. Store interface and required behavior
@@ -237,11 +241,13 @@ keys, err := store.List(ctx, "<prefix>/v1/log/", 1)
 The S3 adapter implements that call with `ListObjectsV2`, `MaxKeys=1`, and no
 delimiter.
 
-Valid commit revisions range from 1 through `math.MaxInt64`; a reverse suffix
-encoding revision 0 is corrupt. An empty result means an empty log. Otherwise the
-sole key must exactly match the commit-key grammar. Decode and invert its suffix
-to obtain the candidate revision, GET it, and validate that the envelope revision
-agrees with the key.
+Valid commit revisions range from 1 through `MaxRevision`; a reverse suffix
+encoding a revision outside that range is corrupt. The reverse encoding still
+subtracts from `math.MaxInt64`, so valid suffixes range from `7fe0000000000000`
+(revision `MaxRevision`) through `7ffffffffffffffe` (revision 1).
+An empty result means an empty log. Otherwise the sole key must exactly match
+the commit-key grammar. Decode and invert its suffix to obtain the candidate
+revision, GET it, and validate that the envelope revision agrees with the key.
 Malformed first results are corruption and must not be skipped.
 
 ## 7. Wire model
@@ -411,6 +417,10 @@ type Config struct {
 
 type Log[T any] struct { /* private */ }
 
+// MaxRevision is also the maximum record count, capped at JavaScript's
+// Number.MAX_SAFE_INTEGER so revisions remain exact in JavaScript Numbers.
+const MaxRevision int64 = 1<<53 - 1
+
 func Open[T any](cfg Config) (*Log[T], error)
 
 // CommitID identifies an append invocation and is reused on retries.
@@ -420,7 +430,7 @@ type CommitID [16]byte
 type RecordHash [32]byte
 
 type Record[T any] struct {
-    Revision   int64 // Starts at 1; values <= 0 are invalid.
+    Revision   int64 // Valid from 1 through MaxRevision.
     CommitID   CommitID
     Value      T
     RecordHash RecordHash
@@ -444,12 +454,20 @@ func (l *Log[T]) LoadRevision(ctx context.Context, revision int64) (*Snapshot[T]
 func (l *Log[T]) AppendTo(ctx context.Context, base *Snapshot[T], value T) (*Snapshot[T], error)
 
 type Range struct {
-    First int64 // inclusive, must be positive
-    Last  int64 // inclusive, must be positive
+    First int64 // inclusive, in [1, MaxRevision]
+    Last  int64 // inclusive, in [1, MaxRevision]
 }
 
-// Scan visits records in increasing revision order. It stops immediately on a
-// callback error. Invalid/out-of-snapshot ranges return ErrRange.
+func All() Range                      { return Range{1, MaxRevision} }
+func StartingAt(revision int64) Range { return Range{revision, MaxRevision} }
+
+// After excludes revision. After(0) is All(); After(MaxRevision) is empty.
+func After(revision int64) Range
+
+// Scan visits the intersection of r and snap in increasing revision order.
+// It stops immediately on a callback error. Invalid bounds return ErrRange;
+// the zero Range is empty. Valid ranges on an empty snapshot or starting past
+// its head yield nothing.
 func (l *Log[T]) Scan(ctx context.Context, snap *Snapshot[T], r Range,
     yield func(Record[T]) error) error
 
@@ -467,8 +485,14 @@ var (
 
 `Snapshot` should expose `Record() Record[T]`, `Revision() int64`, and perhaps
 `Empty() (empty bool)`, but not mutable frontier slices. A nil snapshot reports revision 0.
-`LoadRevision` rejects revisions <= 0 with `ErrRange`. Returning an opaque snapshot
-allows `AppendTo` to reuse the already fetched commit body safely.
+`LoadRevision` rejects revisions outside `[1, MaxRevision]` with `ErrRange`.
+Returning an opaque snapshot allows `AppendTo` to reuse the already fetched
+commit body safely. `Scan` with `All()` visits every record in the snapshot;
+`StartingAt(revision)` visits records from that revision through the snapshot's
+end. `After(revision)` excludes that revision, for resuming after an application
+checkpoint. `After(0)` covers the whole log and `After(MaxRevision)` returns the
+empty zero `Range`. Invalid inputs produce invalid ranges, rejected by `Scan`.
+None of these helpers waits for new records.
 
 `Open` rejects a nil store, malformed prefix, invalid size limits, and negative
 retry counts before performing I/O. Backend-specific configuration such as S3
@@ -561,7 +585,7 @@ Never publish a commit and then fill in its dependencies.
 To read a snapshot in chronological order:
 
 1. Validate the commit envelope and key.
-2. Visit nonempty frontier levels from 15 down to 0.
+2. Visit nonempty frontier levels from highest to lowest (at most 13 down to 0).
 3. Within each level, visit references in stored order.
 4. Recursively expand index nodes in child order.
 5. Decode level-1 segments and yield their records in order.
@@ -624,7 +648,7 @@ For `N` appended records:
 
 The permanent metadata cost of copying a bounded frontier into each commit is
 linear in `N`, not quadratic. Actual byte cost should be benchmarked because a
-near-maximum 231-reference frontier can be tens of kilobytes per append.
+near-maximum 195-reference frontier can be tens of kilobytes per append.
 
 ## 13. S3 adapter: IAM and bucket configuration
 
@@ -679,9 +703,11 @@ in v1. This keeps conditional-create behavior and failure handling simple.
 
 ## 14. Limits and defensive decoding
 
-- Allow revision `math.MaxInt64`, then reject further appends with `ErrExhausted`.
-- Reject revisions <= 0 in public lookups and range scans with `ErrRange`.
-- Reject nonpositive or out-of-int64-range revisions in stored data with `ErrCorrupt`.
+- Allow revision `MaxRevision` (2^53 - 1), then reject further appends with
+  `ErrExhausted`.
+- Reject revisions outside `[1, MaxRevision]` in public lookups and range scans
+  with `ErrRange`, before store I/O. The zero `Range` is an empty-range exception.
+- Reject revisions outside `[1, MaxRevision]` in stored data with `ErrCorrupt`.
 - Reject invalid UTF-8 only as `encoding/json` normally handles it; the exact
   marshaled bytes are authoritative.
 - Limit event JSON before upload.
@@ -748,7 +774,7 @@ benchmarks even if production metrics hooks are deferred.
 At minimum:
 
 1. Reverse-key lexical ordering for revisions 1, 2, 15, 16, 17,
-   `MaxInt64-1`, and `MaxInt64`.
+   `MaxRevision-1`, and `MaxRevision`; reject keys outside the allowed range.
 2. Append/scan round trips for empty log and counts 1, 15, 16, 17, 255, 256,
    and 257.
 3. `Create`-count assertions at all carry boundaries.
