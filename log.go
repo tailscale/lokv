@@ -19,9 +19,13 @@ import (
 )
 
 // MaxRevision is the maximum revision and maximum number of batch records in a log.
-// It equals JavaScript's Number.MAX_SAFE_INTEGER (9007199254740991), so all valid
-// revisions can pass through JavaScript Numbers without losing precision.
-// Appending to a log at MaxRevision returns ErrExhausted.
+// Revisions start at 1; values <= 0 or > MaxRevision are invalid. The limit counts
+// batches, regardless of how many individual events each batch contains.
+// It equals JavaScript's Number.MAX_SAFE_INTEGER (9007199254740991, or 2^53 - 1),
+// so all valid revisions can pass through JavaScript Numbers without losing
+// precision.
+// Appending to a log at MaxRevision returns [ErrExhausted]. Empty snapshots and
+// states with no applied batches report revision zero.
 const MaxRevision int64 = 1<<53 - 1
 
 // Config selects the immutable namespace and resource limits. Zero limits use
@@ -103,12 +107,13 @@ type CommitID [16]byte
 
 // RecordHash is a record's logical SHA-256 hash. It covers the record's revision,
 // commit ID, predecessor's hash, and JSON-encoded batch, linking it to its history.
+// Hashes detect corruption; they do not authenticate writers.
 type RecordHash [32]byte
 
 // Record is an atomically appended batch and its identity. Each successful append
 // creates one record and consumes one revision, regardless of the batch's size.
 type Record[T any] struct {
-	// Revision is the record's sequence number, from 1 through MaxRevision.
+	// Revision is the record's sequence number, from 1 through [MaxRevision].
 	// Values <= 0 or > MaxRevision are invalid.
 	Revision   int64
 	CommitID   CommitID
@@ -331,6 +336,9 @@ func (lg *Log[T]) prepare(value []T) (json.RawMessage, string, error) {
 // The first record has revision 1. Appending after [MaxRevision] returns ErrExhausted.
 // Transport retries belong to the adapter. An unresolved transport error is
 // returned, since the core cannot classify arbitrary backend errors as retryable.
+// Cancellation or a failed lookup after a create error can leave the caller
+// unsure whether the batch committed. A new invocation uses a new commit ID;
+// durable deduplication across calls or restarts needs an application event ID.
 func (lg *Log[T]) Append(ctx context.Context, value ...T) (Record[T], error) {
 	if err := ctx.Err(); err != nil {
 		return Record[T]{}, err
